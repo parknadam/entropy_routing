@@ -1,0 +1,34 @@
+# ============================
+# requirements.txt  (RTX 5090)
+# ============================
+
+# ▶ PyTorch Nightly (CUDA 12.8) 채널 사용
+#--extra-index-url https://download.pytorch.org/whl/nightly/cu128
+#--pre
+
+# === Core (GPU) ===
+#torch
+#torchvision
+#torchaudio
+
+# === HF / Data ===
+transformers>=4.42.0
+datasets>=2.18.0
+accelerate>=0.30.0
+safetensors>=0.4.2
+sentencepiece>=0.2.0
+
+# === Pruning / Utils ===
+peft>=0.11.0
+einops>=0.8.0
+scipy>=1.11.0
+numpy>=1.26.0
+tqdm>=4.66.0
+
+# === (선택) 평가: LM Harness ===
+# 아래 줄을 활성화하면 0-shot 벤치마크 바로 가능
+# git+https://github.com/EleutherAI/lm-evaluation-harness@main
+
+# === (5090 주의) 8-bit(bnb) ===
+# Blackwell(sm_120) 미지원 이슈가 있을 수 있어 기본은 비활성 권장
+# bitsandbytes>=0.43.0
