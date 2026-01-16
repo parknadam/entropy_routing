@@ -1,12 +1,13 @@
-# prune_lora/pruning/entropy_cli.py
+""" # prune_lora/pruning/entropy_cli.py
 # REPL: prompt 입력 → (A/AB/FULL) 단계별 prompt entropy/PPL 측정 → stage 결정 → 해당 stage로 생성
 #
 # 사용:
-#   python -m prune_lora.pruning.entropy_cli \
-#     --base_model meta-llama/Llama-2-7b-hf \
-#     --bundles_dir ./results/pruning/bundles \
-#     --max_new_tokens 128
-#
+   """ 
+   python -m prune_lora.pruning.entropy_cli \
+     --base_model meta-llama/Llama-2-7b-hf \
+     --bundles_dir ./results/pruning/bundles \
+     --max_new_tokens 128
+ """
 # bundles 구조:
 #   results/pruning/bundles/B/layer_021.safetensors ...
 #   results/pruning/bundles/C/layer_025.safetensors ...
@@ -16,7 +17,7 @@
 # - bundles 파일명 0-padding(layer_021) 대응: 디렉토리 스캔으로 idx->path map 구성
 # - KV cache는 안정성 위해 CLI에서는 기본 use_cache=False로 평가/생성
 
-from __future__ import annotations
+""" from __future__ import annotations
 
 import argparse
 import math
@@ -68,8 +69,8 @@ _LAYER_RE = re.compile(r"layer_(\d+)\.safetensors$")
 
 def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
     """
-    bundles/B 또는 bundles/C 스캔해서 {idx:int -> path:Path} 맵 구성.
-    layer_021.safetensors 같은 0-padding도 idx=21로 파싱됨.
+    #bundles/B 또는 bundles/C 스캔해서 {idx:int -> path:Path} 맵 구성.
+    #layer_021.safetensors 같은 0-padding도 idx=21로 파싱됨.
     """
     m: Dict[int, Path] = {}
     if not dir_path.exists():
@@ -84,11 +85,11 @@ def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
     """
-    bundles의 key가 다양한 prefix를 가질 수 있어 레이어 내부 키로 정규화:
-      - model.layers.{i}.xxx
-      - model.model.layers.{i}.xxx
-      - layers.{i}.xxx
-      - 이미 xxx
+    #bundles의 key가 다양한 prefix를 가질 수 있어 레이어 내부 키로 정규화:
+    #  - model.layers.{i}.xxx
+    #  - model.model.layers.{i}.xxx
+    #  - layers.{i}.xxx
+    #  - 이미 xxx
     """
     out = {}
     needles = [
@@ -437,3 +438,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

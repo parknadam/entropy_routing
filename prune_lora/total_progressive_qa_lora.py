@@ -1,11 +1,11 @@
 """
 # Stage1
-python -m Code.PruningAndLoRA.total_progressive_qa_lora \
+python -m prune_lora.total_progressive_qa_lora \
   --base_dir ./results/pruning/A \
   --bundles_dir ./results/pruning/bundles \
   --stage 1 \
   --out_adapters ./results/adapters \
-  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 512 --epochs 1 --bs 4 --grad_acc 8
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 512 --epochs 1 --bs 1 --grad_acc 32
  
 
 # Stage2
@@ -494,12 +494,41 @@ def _enable_only_lora_on_indices_for_adapter_by_name(model, indices: List[int], 
 # QA dataset (SQuAD / SQuAD v2) → SFT labels(mask prompt)
 # 성능 -> LoRA Rank 높여보기(r, 4,8,16,.... 일반적으로 rank8에서 성능이 정점 달성) + lora_alpha 조정하기(보통 rank의 2배값), 학습률 조정
 # ----------------------------
-def _build_prompt(context: str, question: str, unans_token="unanswerable"):
+""" def _build_prompt(context: str, question: str, unans_token="unanswerable"):
     return (
         "You are a helpful QA assistant. Answer the question using the context. "
         f"If the answer is not in the context, say '{unans_token}'.\n\n"
         f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    ) """
+
+def _build_chat_messages(context: str, question: str, qa_dataset: str, unans_token="unanswerable"):
+    sys = "You are a helpful QA assistant."
+    if qa_dataset == "squad_v2":
+        sys += f" If the answer is not in the context, say '{unans_token}'."
+
+    user = (
+        "Answer the question using the context.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        "Answer:"
     )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def _encode_chat_prompt_ids(tokenizer, messages):
+    # ✅ 너 환경은 chat_template이 있으므로 이 경로가 사용됨
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True  # assistant 답변 시작 지점까지 포함
+    )
+    # apply_chat_template가 list[int]를 보통 주지만, 혹시 dict면 대응
+    if isinstance(prompt_ids, dict):
+        prompt_ids = prompt_ids["input_ids"]
+    return prompt_ids
 
 
 def _load_qa_sft_dataset(
@@ -517,7 +546,7 @@ def _load_qa_sft_dataset(
 
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
-    def to_ex(ex):
+    """ def to_ex(ex):
         ctx = ex.get("context","")
         q = ex.get("question","")
         ans_list = ex.get("answers",{}).get("text",[])
@@ -564,6 +593,70 @@ def _load_qa_sft_dataset(
             "attention_mask": attn,
             "labels": labels,
             "__drop__": drop,
+        } """
+
+    def to_ex(ex):
+        ctx = ex.get("context", "")
+        q = ex.get("question", "")
+        ans_list = ex.get("answers", {}).get("text", [])
+        target = (ans_list[0] if ans_list else ("unanswerable" if qa_dataset == "squad_v2" else ""))
+
+        messages = _build_chat_messages(ctx, q, qa_dataset, unans_token=unans_token)
+        prompt_ids = _encode_chat_prompt_ids(tokenizer, messages)
+
+        # ⚠️ 공백 하나를 앞에 붙여주는 게 보통 더 안정적 (원래 코드도 prompt + " " + target 했음)
+        ans_text = (" " + target) if target else ""
+        ans_ids = tokenizer(ans_text, add_special_tokens=False)["input_ids"]
+
+        if add_eos and tokenizer.eos_token_id is not None:
+            ans_ids = ans_ids + [tokenizer.eos_token_id]
+
+        # 답변 토큰이 없으면 드롭
+        if len(ans_ids) < 1:
+            return {"__drop__": 1}
+
+        full_ids = prompt_ids + ans_ids
+        prompt_len = len(prompt_ids)
+
+        # 길면 왼쪽을 잘라서(최근 토큰 유지) answer가 남도록
+        if len(full_ids) > seq_len:
+            cut = len(full_ids) - seq_len
+            full_ids = full_ids[cut:]
+            prompt_len = max(0, prompt_len - cut)
+
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        pad_len = seq_len - len(full_ids)
+
+        # 너는 padding_side="left"니까 left pad 고정
+        input_ids = ([pad_id] * pad_len) + full_ids
+        attention_mask = ([0] * pad_len) + ([1] * len(full_ids))
+
+        # labels: pad + prompt 구간은 -100, answer만 학습
+        labels = input_ids.copy()
+
+        # pad 마스킹
+        for i in range(pad_len):
+            labels[i] = -100
+
+        # prompt 마스킹
+        prompt_start = pad_len
+        prompt_end = pad_len + prompt_len
+        for i in range(prompt_start, min(prompt_end, seq_len)):
+            labels[i] = -100
+
+        # answer가 완전히 잘린 케이스 방지
+        if prompt_end >= seq_len:
+            return {"__drop__": 1}
+        # 디버그: labels가 -100이 아닌 부분(=답변)만 디코드해서 확인
+        if torch.rand(1).item() < 0.0002:
+            ans_only = [tid for tid, lab in zip(input_ids, labels) if lab != -100]
+            print("[debug answer-only]", tokenizer.decode(ans_only))
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "__drop__": 0,
         }
 
     ds = ds.map(to_ex, remove_columns=ds.column_names)
@@ -656,6 +749,11 @@ def train_lora(model, tokenizer, out_dir: str, train_ds, eval_ds=None, lr=2e-4, 
         learning_rate=lr,
         num_train_epochs=epochs,
         logging_steps=20,
+        per_device_eval_batch_size=1,
+        eval_accumulation_steps=32,
+        prediction_loss_only=True,
+        fp16_full_eval=True,
+        gradient_checkpointing=True,
         # --- 검증 관련 설정 추가 ---
         #evaluation_strategy="epoch" if has_eval else "no",  # 1 에포크마다 검증 수행
         #save_strategy="epoch" if has_eval else "no",        # 검증과 동일하게 설정 (체크포인트 저장 안 할 거면 "no" 유지 가능)
@@ -737,6 +835,11 @@ def main():
     model.to(device)  #CPU로 이동
     model.config.use_cache = False
 
+    model.gradient_checkpointing_enable()
+    try:
+        model.enable_input_require_grads()  # PEFT + checkpointing 안전장치
+    except Exception:
+        pass
     # keep 32 logical layers for A stage convenience
     model = _reapply_passlayers_from_manifest(model, args.base_dir)
     is_opt = "opt" in model.config.model_type.lower()

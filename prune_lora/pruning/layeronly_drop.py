@@ -2,15 +2,15 @@
 # 드랍 전용 엔트리: 유사도 기반 연속 블록 제거 + B/C 번들 저장 + A 저장(토크나이저 포함)
 """
 python -m prune_lora.pruning.layeronly_drop \
-  --model meta-llama/Llama-2-13b-chat-hf \
+  --model meta-llama/Llama-2-7b-chat-hf \
   --device cuda:0 \
-  --drop_frac 0.30 \
+  --drop_frac 0.25 \
   --keep_last_layer \
   --nsamples 64 \
   --seqlen 2048 \
   --max_batches 32 \
-  --save_dir ./results/pruning/A \
-  --save_removed_dir ./results/pruning/bundles
+  --save_dir ./7b_results/pruning/A \
+  --save_removed_dir ./7b_results/pruning/bundles
 """
 
 import argparse
