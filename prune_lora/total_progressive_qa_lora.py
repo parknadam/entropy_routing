@@ -1,11 +1,11 @@
 """
 # Stage1
 python -m prune_lora.total_progressive_qa_lora \
-  --base_dir ./results/pruning/A \
-  --bundles_dir ./results/pruning/bundles \
+  --base_dir ./7b_results/pruning/A \
+  --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 \
-  --out_adapters ./results/adapters \
-  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 512 --epochs 1 --bs 1 --grad_acc 32
+  --out_adapters ./lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 1024 --epochs 1 --bs 1 --grad_acc 32
  
 
 # Stage2

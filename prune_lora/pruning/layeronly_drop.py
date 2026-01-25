@@ -7,7 +7,7 @@ python -m prune_lora.pruning.layeronly_drop \
   --drop_frac 0.25 \
   --keep_last_layer \
   --nsamples 64 \
-  --seqlen 2048 \
+  --seqlen 1024 \
   --max_batches 32 \
   --save_dir ./7b_results/pruning/A \
   --save_removed_dir ./7b_results/pruning/bundles
