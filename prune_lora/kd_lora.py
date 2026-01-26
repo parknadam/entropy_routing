@@ -10,6 +10,19 @@ python -m prune_lora.kd_lora \
   --epochs 1 \
   --bs 1 \
   --grad_acc 32
+
+python -m prune_lora.kd_lora \
+  --base_dir /dev/shm/7b_results/pruning/A \
+  --stage 1 \
+  --out_adapters /dev/shm/kd_lora_results/adapters \
+  --qa_dataset squad \
+  --max_samples 20000 \
+  --max_eval_samples 8000 \
+  --seq_len 1024 \
+  --epochs 1 \
+  --bs 1 \
+  --grad_acc 32
+
 """
 
 
