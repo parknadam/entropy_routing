@@ -11,6 +11,7 @@ python -m prune_lora.kd_lora \
   --bs 1 \
   --grad_acc 32
 
+# vast ai 훈련용
 python -m prune_lora.kd_lora \
   --base_dir /dev/shm/7b_results/pruning/A \
   --stage 1 \
@@ -18,6 +19,7 @@ python -m prune_lora.kd_lora \
   --qa_dataset squad \
   --max_samples 20000 \
   --max_eval_samples 8000 \
+  --lr 1e-5 \
   --seq_len 1024 \
   --epochs 1 \
   --bs 1 \
@@ -29,6 +31,7 @@ python -m prune_lora.kd_lora \
 import os
 import argparse
 import torch
+import math
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import (
@@ -87,22 +90,46 @@ def load_qa_dataset(tokenizer, args):
         eval_ds = eval_ds.shuffle(seed=42).select(range(min(args.max_eval_samples, len(eval_ds))))
 
     def preprocess(ex):
-        # SQuAD 특화 포맷팅
         ctx = ex.get("context", "")
         q = ex.get("question", "")
         ans = ex.get("answers", {}).get("text", [""])[0]
-        
+
+        reserve_ans = 64  # 답변을 위해 최소 64토큰 공간 확보(조절 가능)
+
         prompt = f"Context: {ctx}\nQuestion: {q}\nAnswer:"
+
+        prompt_ids = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=max(1, args.seq_len - reserve_ans),
+            padding=False,
+        )["input_ids"]
+        prompt_trunc = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
         full_text = prompt + " " + ans + tokenizer.eos_token
-        
-        inputs = tokenizer(full_text, truncation=True, max_length=args.seq_len, padding="max_length")
-        prompt_ids = tokenizer(prompt, truncation=True, max_length=args.seq_len)["input_ids"]
-        
-        labels = list(inputs["input_ids"])
-        # 프롬프트 부분은 -100으로 마스킹 (Loss 계산 제외)
-        for i in range(len(prompt_ids)):
+
+        inputs = tokenizer(
+            full_text,
+            truncation=True,
+            max_length=args.seq_len,
+            padding="max_length",
+        )
+
+        # 1) labels 생성 (tokenizer는 labels를 안 줌)
+        labels = inputs["input_ids"].copy()
+
+        # 프롬프트 부분 마스킹
+        prompt_ids2 = tokenizer(prompt_trunc, truncation=True, max_length=args.seq_len, padding=False)["input_ids"]
+        prompt_len = min(len(prompt_ids2), len(labels))
+        for i in range(prompt_len):
             labels[i] = -100
-            
+
+        # pad 마스킹
+        attn = inputs["attention_mask"]
+        for i in range(len(labels)):
+            if attn[i] == 0:
+                labels[i] = -100
+
         inputs["labels"] = labels
         return inputs
 
@@ -114,39 +141,94 @@ def load_qa_dataset(tokenizer, args):
 # 3) KD Trainer 정의
 # -----------------------------
 class KDTrainer(Trainer):
-    def __init__(self, *args, teacher_model=None, alpha=0.5, **kwargs):
+    def __init__(self, *args, teacher_model=None, alpha=0.5, temperature=2.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model.eval()
         self.alpha = alpha
+        self.T = temperature
 
-    # 이 부분의 인자를 수정합니다.
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-        labels = inputs.get("labels")
-        student_outputs = model(**inputs)
-        s_logits = student_outputs.logits
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs["labels"]
 
+        # student forward
+        student_outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+        )
+        s_logits_full = student_outputs.logits  # [B, L, V]
+
+        # ✅ CausalLM shift 먼저
+        s_logits = s_logits_full[:, :-1, :].contiguous()
+        labels_s = labels[:, 1:].contiguous()
+        attn_s   = inputs["attention_mask"][:, 1:].contiguous()
+
+        # ✅ supervised token mask
+        mask = (labels_s != -100) & (attn_s == 1)
+        tok_n = int(mask.sum().item())
+
+        # ✅ tok_n=0 방어 (teacher도 안 돌림)
+        if tok_n == 0:
+            log_steps = getattr(self.args, "logging_steps", 0)
+            gs = getattr(self.state, "global_step", 0)
+            if log_steps and log_steps > 0 and (gs % log_steps == 0):
+                self.log({"skip_batch_no_supervised_tokens": 1.0, "tok_n": 0.0})
+            loss = s_logits_full.sum() * 0.0  # grad-safe
+            return (loss, student_outputs) if return_outputs else loss
+
+        # teacher forward (필요할 때만)
         with torch.no_grad():
-            # Teacher 모델 연산 (GPU 1)
-            t_inputs = {k: v.to(self.teacher_model.device) for k, v in inputs.items() if k != "labels"}
-            t_logits = self.teacher_model(**t_inputs).logits.to(s_logits.device)
+            t_inputs = {
+                "input_ids": inputs["input_ids"].to(self.teacher_model.device),
+                "attention_mask": inputs["attention_mask"].to(self.teacher_model.device),
+            }
+            t_logits_full = self.teacher_model(**t_inputs).logits.to(s_logits_full.device)
 
-        # Distillation Loss 계산
-        mask = labels.ne(-100)
-        s_logits_sl = s_logits[mask]
-        t_logits_sl = t_logits[mask]
-        labels_sl = labels[mask]
+        t_logits = t_logits_full[:, :-1, :].contiguous()
+
+        # gather
+        s = s_logits[mask]      # [N, V]
+        t = t_logits[mask]      # [N, V]
+        y = labels_s[mask]      # [N]
+
+        # fp32 for stability (✅ 먼저 float로 만들기)
+        s_fp32 = s.float()
+        t_fp32 = t.float()
+
+        # (선택) logits 범위 제한: 안정성 크게 올라감
+        s_fp32 = s_fp32.clamp(-50, 50)
+        t_fp32 = t_fp32.clamp(-50, 50)
+
+        # fp32 for stability
+        T = self.T
+
+        log_s = F.log_softmax(s_fp32 / T, dim=-1)
+        log_t = F.log_softmax(t_fp32 / T, dim=-1)
 
         soft_loss = F.kl_div(
-            F.log_softmax(s_logits_sl / 2.0, dim=-1),
-            F.softmax(t_logits_sl / 2.0, dim=-1),
-            reduction="batchmean"
-        ) * (2.0 ** 2)
-        
-        hard_loss = F.cross_entropy(s_logits_sl, labels_sl)
+            log_s,
+            log_t,
+            reduction="batchmean",
+            log_target=True,   # ✅ 중요
+        ) * (T * T)
+
+        hard_loss = F.cross_entropy(s_fp32, y)
         loss = self.alpha * soft_loss + (1 - self.alpha) * hard_loss
-        
+
+        # logging
+        log_steps = getattr(self.args, "logging_steps", 0)
+        gs = getattr(self.state, "global_step", 0)
+        if log_steps and log_steps > 0 and (gs % log_steps == 0):
+            hard = hard_loss.detach().float().item()
+            soft = soft_loss.detach().float().item()
+            self.log({
+                "tok_n": float(tok_n),
+                "kd_soft": soft,
+                "kd_hard": hard,
+                "kd_ppl": math.exp(hard),
+            })
+
         return (loss, student_outputs) if return_outputs else loss
-    
+
 
 # -----------------------------
 # 4) Main 실행 부
@@ -166,11 +248,23 @@ def main():
     teacher = AutoModelForCausalLM.from_pretrained(args.teacher_model, torch_dtype=torch.float16, load_in_4bit=True, device_map={"": 1})
 
     # LoRA 설정
+    # lora_config = LoraConfig(
+    #     r=args.rank,
+    #     target_modules=["q_proj", "v_proj"],
+    #     task_type=TaskType.CAUSAL_LM,
+    # )
     lora_config = LoraConfig(
-        r=args.rank,
-        target_modules=["q_proj", "v_proj"],
+        r=8,                    # stageA랑 동일
+        lora_alpha=16,          # 보통 2*r
+        lora_dropout=0.05,
+        bias="none",
         task_type=TaskType.CAUSAL_LM,
+        target_modules=[
+            "q_proj","k_proj","v_proj","o_proj",
+            "gate_proj","up_proj","down_proj"
+        ],
     )
+
     student = get_peft_model(student, lora_config)
     student.print_trainable_parameters()
 
@@ -184,10 +278,28 @@ def main():
         per_device_train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        fp16=args.fp16,
+        bf16=True,
+        fp16=False,
+
+        # 로그
+        logging_strategy="steps",
         logging_steps=10,
-        eval_strategy="epoch",  # 'evaluation_strategy'를 'eval_strategy'로 변경
-        save_strategy="no"
+        logging_first_step=True,
+
+        # 중간 평가(잘 되고 있는지 확인용)
+        eval_strategy="steps",
+        eval_steps=200,
+
+        # 중간 저장(혹시 망하면 여기서 되돌릴 수 있게)
+        save_strategy="steps",
+        save_steps=200,
+        save_total_limit=2,
+
+        # 안정성/가독성
+        max_grad_norm=1.0,
+        remove_unused_columns=False,  # inputs에 labels/attention_mask 유지
+        report_to=["tensorboard"],    # 싫으면 [] 로
+        logging_dir=os.path.join(args.out_adapters, "tb"),
     )
 
     trainer = KDTrainer(
@@ -195,6 +307,7 @@ def main():
         args=train_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
+        data_collator=default_data_collator,
         teacher_model=teacher,
         alpha=args.alpha
     )
