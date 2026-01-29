@@ -9,12 +9,12 @@
 """
 # lora 어댑터
 python -m prune_lora.eval_ppl \
-     --base_model /dev/shm/results/pruning/A \
-     --bundles_dir /dev/shm/results/pruning/bundles \
+     --base_model ./7b_results/pruning/A \
+     --bundles_dir ./7b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --device cuda:0 --dtype bf16 \
-     --lora_A   ./adapters/stageA \
+     --lora_A   ./kd_result3/adapters/A_lora/stageA/stageA \
      --lora_AB  ./adapters/stageAB \
      --lora_FULL ./adapters/stageFULL
 
