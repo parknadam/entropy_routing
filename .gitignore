@@ -173,6 +173,12 @@ cython_debug/
 .pypirc
 
 # 모델
+7b_results/
+kd_lora_results/
+data/
+qwen_results/
+llama2_7b_merged_models/
+
 A/
 bundles/
 adapters/

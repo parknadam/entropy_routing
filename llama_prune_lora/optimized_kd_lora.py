@@ -3,15 +3,16 @@
 최적화된 KD-LoRA 학습 코드 (버그 수정 완료)
 
 사용법:
+CUDA_VISIBLE_DEVICES=0,4 DEVICE=cuda:0 \
 python -m prune_lora.optimized_kd_lora \
   --base_dir ./7b_results/pruning/A \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 \
-  --out_adapters ./kd_lora_results2/adapters \
+  --out_adapters ./kd_lora_results/adapters \
   --qa_dataset squad \
   --max_samples 20000 \
   --max_eval_samples 8000 \
-  --seq_len 1024 --lr 1e-4 --epochs 2 --bs 4 --grad_acc 8 \
+  --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
   --teacher_4bit --teacher_device cuda:1 \
   --kd_alpha 0.1 --kd_T 2.0

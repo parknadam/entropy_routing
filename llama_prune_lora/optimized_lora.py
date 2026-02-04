@@ -7,6 +7,24 @@
 3. Gradient checkpointing 개선
 4. 효율적인 배치 처리
 5. 토크나이저 최적화
+
+# Stage1
+python -m prune_lora.optimized_lora.py \
+  --base_dir ./7b_results/pruning/A \
+  --bundles_dir ./7b_results/pruning/bundles \
+  --stage 1 \
+  --out_adapters ./lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 1024 --epochs 1 --bs 1 --grad_acc 32
+ 
+
+# Stage2
+python Code.PruningAndLoRA.total_progressive_qa_lora.py \
+  --base_dir ~/Code/results/pruning/A \
+  --bundles_dir ~/Code/results/pruning/bundles \
+  --stage 2 \
+  --out_adapters ~/Code/results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 --seq_len 512 --epochs 1 --bs 4 --grad_acc 8
+
 """
 
 import os, json, torch
