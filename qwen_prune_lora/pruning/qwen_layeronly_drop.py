@@ -6,7 +6,7 @@
 python -m qwen_prune_lora.pruning.qwen_layeronly_drop \
   --model Qwen/Qwen-7B \
   --device cuda:0 \
-  --drop_frac 0.25 \
+  --drop_frac 0.10 \
   --keep_last_layer \
   --nsamples 64 \
   --seqlen 1024 \

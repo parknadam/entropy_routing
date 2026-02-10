@@ -1,28 +1,37 @@
-# Qwen 모델 전용 PPL 평가 코드
-# A / AB / ABC(FULL) stage별 "corpus perplexity" 평가 + (옵션) LoRA 어댑터
+# mistral_prune_lora/mistral_eval_ppl.py
+# A / AB / ABC(FULL) stage별 "corpus perplexity" 평가 + (옵션) LoRA 어댑터(merge 없이) 얹어서 ppl 평가
+# 즉 모델 + lora 어댑터
+# - user prompt 말고, dataset/text_file로 perplexity를 측정
+# - loader가 dict/tuple(tensor,tensor)/tensor/str(line) 어떤 형태로 나오든 처리
+# - LoRA는 merge 없이 PeftModel로 감싼 채 평가 (stage마다 모델 fresh load로 오염 방지)
 #
-# Usage:
+# Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
-# Qwen-7B 기본 평가
-python -m qwen_prune_lora.qwen_eval_ppl \
-     --base_model ./qwen_results/pruning/A \
-     --bundles_dir ./qwen_results/pruning/bundles \
+# lora 어댑터
+python -m mistral_prune_lora.mistral_eval_ppl \
+     --base_model ./25_mistral_results/pruning/A \
+     --bundles_dir ./25_mistral_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
-     --device cuda:0 --dtype bf16
+     --device cuda:2 --dtype bf16 \
+     --lora_A   ./mistral_results/adapters/A_lora/stageA \
+     --lora_AB  ./mistral_lora/adapters/stageAB \
+     --lora_FULL ./mistral_lora/adapters/stageFULL
 
-# LoRA 어댑터 포함
-python -m prune_lora.eval_ppl_qwen \
-     --base_model ./qwen_results/pruning/A \
-     --bundles_dir ./qwen_results/pruning/bundles \
+python -m mistral_prune_lora.mistral_eval_ppl \
+     --base_model ./merged_models_mistral_7b/A_merged \
+     --bundles_dir ./25_mistral_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
-     --device cuda:0 --dtype bf16 \
-     --lora_A  ./kd_lora_results/qwen/adapters/stage_1 \
-     --lora_AB ./kd_lora_results/qwen/adapters/stage_2 \
-     --lora_FULL ./kd_lora_results/qwen/adapters/stage_3
-"""
+     --device cuda:3 --dtype bf16
 
+
+"""
+   
+# Note:
+# - --lora_*에 콤마(,)로 여러 경로를 주면, "각 어댑터를 따로" 평가합니다. (누적 적용 아님)
+
+from __future__ import annotations
 
 import argparse
 import inspect
@@ -51,10 +60,11 @@ except Exception:
 # -----------------------------
 def _try_import_get_loaders():
     cands = [
-        "prune_lora.pruning.data",
-        "prune_lora.pruning.lm_datasets",
-        "prune_lora.pruning.data_utils",
-        "prune_lora.pruning.dataset",
+        "mistral_prune_lora.pruning.data",
+        "pruning.data",
+        "mistral_prune_lora.pruning.lm_datasets",
+        "mistral_prune_lora.pruning.data_utils",
+        "mistral_prune_lora.pruning.dataset",
     ]
     for m in cands:
         try:
@@ -69,32 +79,25 @@ def _try_import_get_loaders():
 GET_LOADERS = _try_import_get_loaders()
 
 # -----------------------------
-# Qwen 모델용 DecoderLayer import
+# transformers 버전에 따라 MistralDecoderLayer import 경로가 다름
 # -----------------------------
 try:
-    from transformers.models.qwen.modeling_qwen import QWenBlock as QwenDecoderLayer
+    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 except Exception:
-    try:
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer as QwenDecoderLayer
-    except Exception:
-        QwenDecoderLayer = None
+    MistralDecoderLayer = None
 
 
-def _get_qwen_layers(model) -> nn.ModuleList:
-    """Qwen 모델의 레이어 추출"""
-    # Qwen1 구조
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return model.transformer.h
-    # Qwen2 구조
+def _get_mistral_layers(model) -> nn.ModuleList:
+    # base model
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
-    # 일반 구조
+    # some wrappers
     if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
         return model.model.model.layers
-    raise RuntimeError("Qwen layers 경로를 찾지 못했어요. (예: model.transformer.h)")
+    raise RuntimeError("Mistral layers 경로를 찾지 못했어요. (예: model.model.layers)")
 
 
-class QwenPassLayer(nn.Module):
+class MistralPassLayer(nn.Module):
     def __init__(self, return_tuple: bool = True):
         super().__init__()
         self.return_tuple = return_tuple
@@ -110,26 +113,27 @@ class QwenPassLayer(nn.Module):
         cache_position=None,
         **kwargs,
     ):
-        # Qwen remote code는 outputs[0]을 하므로 "무조건 tuple"로 반환
-        return (hidden_states,)
+        if not self.return_tuple:
+            return hidden_states
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs = outputs + (None,)
+        if use_cache:
+            outputs = outputs + (past_key_value,)
+        return outputs
 
 
 def _detect_layer_return_tuple(model) -> bool:
-    """Qwen 모델의 레이어 반환 형태 자동 추정"""
+    """
+    transformers 버전에 따라 decoder_layer의 반환 형태가 달라질 수 있어,
+    PassLayer도 동일한 형태로 맞춰주기 위한 휴리스틱.
+    """
     try:
-        # Qwen1
-        if hasattr(model, "transformer"):
-            core = model.transformer
-        # Qwen2
-        elif hasattr(model, "model"):
-            core = model.model
-        else:
-            core = model
-            
+        core = model.model if hasattr(model, "model") else model
         src = inspect.getsource(core.forward)
-        if "layer_outputs[0]" in src or "layer_outputs = " in src:
+        if "layer_outputs[0]" in src or "layer_outputs = decoder_layer" in src:
             return True
-        if "hidden_states = " in src and "layer_outputs[0]" not in src:
+        if "hidden_states = decoder_layer" in src and "layer_outputs[0]" not in src:
             return False
     except Exception:
         pass
@@ -152,14 +156,11 @@ def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
 
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
-    """Qwen 모델용 prefix 제거"""
     out = {}
     needles = [
-        f"transformer.h.{layer_idx}.",  # Qwen1
-        f"model.layers.{layer_idx}.",   # Qwen2
+        f"model.layers.{layer_idx}.",
         f"model.model.layers.{layer_idx}.",
         f"layers.{layer_idx}.",
-        f"h.{layer_idx}.",
     ]
     for k, v in sd.items():
         nk = k
@@ -211,16 +212,11 @@ class DynamicStageManager:
         dtype: torch.dtype,
         passlayer_return_tuple: bool,
     ):
-        if QwenDecoderLayer is None:
-            raise RuntimeError("QwenDecoderLayer import 실패 (Qwen 모델/transformers 버전 확인).")
+        if MistralDecoderLayer is None:
+            raise RuntimeError("MistralDecoderLayer import 실패 (mistral 모델/transformers 버전 확인).")
 
         self.model = model
-        self.layers = _get_qwen_layers(model)
-
-        # 원본 레이어 클래스 저장 (trust_remote_code로 로드된 진짜 클래스)
-        self._layer_cls = type(self.layers[0])
-        self._layer_init_sig = inspect.signature(self._layer_cls.__init__)
-        
+        self.layers = _get_mistral_layers(model)
         self.device = device
         self.dtype = dtype
         self.passlayer_return_tuple = passlayer_return_tuple
@@ -260,16 +256,10 @@ class DynamicStageManager:
         if p is None:
             raise FileNotFoundError(f"layer_{layer_i}.safetensors not found in B/C.")
 
-        # ✅ 원본 레이어 클래스(type)로 새 레이어 생성
         try:
-            # (self, config, layer_idx) 형태 지원하면
-            if len(self._layer_init_sig.parameters) >= 3:
-                new_layer = self._layer_cls(self.model.config, layer_i)
-            else:
-                new_layer = self._layer_cls(self.model.config)
-        except Exception:
-            # 혹시 config도 안 받는 특이 케이스
-            new_layer = self._layer_cls()
+            new_layer = MistralDecoderLayer(self.model.config, layer_i)
+        except TypeError:
+            new_layer = MistralDecoderLayer(self.model.config)
 
         new_layer = new_layer.to(self.device, dtype=self.dtype)
 
@@ -277,17 +267,17 @@ class DynamicStageManager:
         sd = _strip_layer_prefix(sd, layer_i)
 
         missing, unexpected = new_layer.load_state_dict(sd, strict=False)
-        if missing or unexpected:
+        if (len(missing) > 0 or len(unexpected) > 0):
+            # 너무 시끄럽게 출력하긴 싫어서 warn 정도만
             print(f"[WARN] layer {layer_i}: missing={len(missing)} unexpected={len(unexpected)}")
 
         old = self.layers[layer_i]
         self.layers[layer_i] = new_layer
         del old
 
-
     def _pass_one_layer(self, layer_i: int):
         old = self.layers[layer_i]
-        self.layers[layer_i] = QwenPassLayer().to(self.device)
+        self.layers[layer_i] = MistralPassLayer(return_tuple=self.passlayer_return_tuple).to(self.device)
         del old
 
     def set_stage(self, stage: str):
@@ -302,11 +292,9 @@ class DynamicStageManager:
         else:
             pass_set = set()
 
-
-
         for i in self.removed:
             cur = self.layers[i]
-            is_pass = isinstance(cur, QwenPassLayer)
+            is_pass = isinstance(cur, MistralPassLayer)
             if i in pass_set:
                 if not is_pass:
                     self._pass_one_layer(i)
@@ -338,7 +326,12 @@ def _extract_batch(
     device: str,
     seqlen: int,
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """batch를 {input_ids, attention_mask, labels?} 형태로 정규화"""
+    """
+    Returns dict:
+      - input_ids [B,T]
+      - attention_mask [B,T]
+      - labels [B,T] (optional; -100 supported)
+    """
     # 1) dict
     if isinstance(batch, dict):
         if "input_ids" in batch:
@@ -350,6 +343,7 @@ def _extract_batch(
                 return None
             input_ids = _ensure_2d(input_ids)
 
+            # optional: 너무 길면 잘라서 안정화
             if input_ids.size(1) > seqlen:
                 input_ids = input_ids[:, :seqlen]
 
@@ -362,6 +356,7 @@ def _extract_batch(
                 if attn.size(1) > input_ids.size(1):
                     attn = attn[:, : input_ids.size(1)]
                 elif attn.size(1) < input_ids.size(1):
+                    # 부족하면 1로 패딩
                     pad = torch.ones((attn.size(0), input_ids.size(1) - attn.size(1)), dtype=attn.dtype)
                     attn = torch.cat([attn, pad], dim=1)
                 attn = attn.to(device)
@@ -431,7 +426,9 @@ def _pack_text_lines_to_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    """텍스트 라인을 토큰화해서 배치로 생성"""
+    """
+    loader가 str(라인)들을 뱉는 경우: tokenize해서 연속 토큰 스트림으로 붙인 뒤 seqlen 블록으로 잘라 배치 생성
+    """
     buf: List[int] = []
     made = 0
     cur_batch: List[torch.Tensor] = []
@@ -485,7 +482,13 @@ def _normalize_loader_to_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    """다양한 형태의 loader를 정규화"""
+    """
+    raw_loader가:
+      - iterable of dict/tuple/tensor  -> extract_batch로 바로 처리
+      - iterable of str               -> pack_text_lines_to_batches로 처리
+      - str or list[str]             -> pack 처리
+      - torch.Tensor (whole corpus)  -> chunk 처리
+    """
     if isinstance(raw_loader, str):
         return _pack_text_lines_to_batches(iter([raw_loader]), tok, seqlen, batch_size, device, max_batches)
 
@@ -522,6 +525,7 @@ def _normalize_loader_to_batches(
         return iter([])
 
     if isinstance(first, str):
+
         def _lines():
             yield first
             for x in it:
@@ -556,7 +560,11 @@ def _normalize_loader_to_batches(
 # -----------------------------
 @torch.no_grad()
 def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, float]:
-    """Token-weighted NLL / PPL 계산"""
+    """
+    Token-weighted NLL / PPL.
+    If labels exist (-100 allowed), use them directly.
+    Else do next-token shift on input_ids.
+    """
     sum_nll = 0.0
     sum_tok = 0
 
@@ -570,12 +578,12 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
         if attn.dim() != 2:
             attn = _ensure_2d(attn)
 
-        # case 1) labels provided
+        # case 1) labels provided: cross_entropy(ignore_index=-100)
         if labels is not None:
             if labels.dim() != 2:
                 labels = _ensure_2d(labels)
 
-            # attention_mask=0인 곳은 loss에서 제외
+            # ✅ attention_mask=0인 곳은 loss에서 제외되도록 -100 처리
             if attn is not None:
                 labels = labels.clone()
                 labels[attn == 0] = -100
@@ -595,12 +603,12 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
             sum_tok += int(tok_cnt)
             continue
 
-        # case 2) no labels: next-token shift
+        # case 2) no labels: next-token shift with attention_mask
         if input_ids.shape[1] < 2:
             continue
 
         out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-        logits = out.logits
+        logits = out.logits  # [B,T,V]
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
@@ -625,57 +633,27 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
 
 
 def _load_model(base_model: str, dtype: torch.dtype, device: str):
-    """Qwen 모델 로드 (meta tensor 문제 완전 대응)"""
-    import os
-    
-    # HF_HUB_DISABLE_IMPLICIT_TOKEN 설정으로 불필요한 경고 방지
-    os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-    
-    print(f"[INFO] Loading model from: {base_model}")
-    print(f"[INFO] Target device: {device}, dtype: {dtype}")
-    
-    # 방법 1: device_map으로 직접 로드 (가장 안전)
-    if device.startswith("cuda") or device == "auto":
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                base_model,
-                torch_dtype=dtype,
-                device_map={"": device} if device.startswith("cuda") else "auto",  # 단일 GPU에 전체 로드
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            )
-            print(f"[SUCCESS] Model loaded with device_map")
-            return model
-        except Exception as e:
-            print(f"[WARN] device_map 로드 실패, CPU 로드 후 이동 시도: {e}")
-    
-    # 방법 2: CPU에 로드 후 명시적 이동
+    # transformers 버전별 호환
     try:
-        print("[INFO] Loading to CPU first...")
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            torch_dtype=torch.float32 if dtype == torch.float32 else torch.float16,  # CPU는 bf16 제한적 지원
-            trust_remote_code=True,
-            low_cpu_mem_usage=False,  # meta tensor 완전 방지
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
         )
-        
-        if device != "cpu":
-            print(f"[INFO] Moving model to {device}...")
-            if dtype == torch.bfloat16:
-                model = model.to(device).to(dtype)  # bf16은 GPU 이동 후
-            else:
-                model = model.to(device)
-        
-        print(f"[SUCCESS] Model loaded and moved to {device}")
-        return model
-        
-    except Exception as e:
-        print(f"[ERROR] 모델 로드 실패: {e}")
-        raise
+    except TypeError:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, low_cpu_mem_usage=True)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, low_cpu_mem_usage=True)
+    return model.to(device)
 
 
 def _pick_split(obj: Any, split: str) -> Any:
-    """데이터셋 split 선택"""
+    """
+    get_loaders 반환이 (train, test) / dict / single 인 경우 대응.
+    split 선택 결과가 str로 떨어지면(가끔 키가 텍스트로 들어감) 다른 후보로 스왑 시도.
+    """
     if isinstance(obj, dict):
         if split in obj:
             return obj[split]
@@ -695,7 +673,6 @@ def _pick_split(obj: Any, split: str) -> Any:
 
 
 def _apply_lora_no_merge(model, adapter_path: str):
-    """LoRA 어댑터 적용 (merge 없이)"""
     if adapter_path is None:
         return None
     if PeftModel is None:
@@ -706,59 +683,41 @@ def _apply_lora_no_merge(model, adapter_path: str):
 
 
 def _parse_lora_list(spec: Optional[str]) -> List[str]:
-    """콤마로 구분된 LoRA 경로 파싱"""
     if not spec:
         return []
     return [p.strip() for p in spec.split(",") if p.strip()]
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Qwen 모델용 PPL 평가")
-    ap.add_argument("--base_model", required=True, help="Qwen 모델 경로 또는 HF ID (예: Qwen/Qwen-7B)")
-    ap.add_argument("--bundles_dir", required=True, help="bundles 디렉토리 (B/, C/ 포함)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base_model", required=True)
+    ap.add_argument("--bundles_dir", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
 
     ap.add_argument("--dataset", default="wikitext2")
     ap.add_argument("--split", default="test")
-    ap.add_argument("--seqlen", type=int, default=2048, help="Qwen은 기본 2048 지원")
+    ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_batches", type=int, default=None)
 
-    ap.add_argument("--text_file", default=None, help="텍스트 파일로 직접 평가 (권장)")
-    
-    # 원본 모델 평가 옵션
-    ap.add_argument("--eval_original", action="store_true", help="원본 모델도 함께 평가")
-    ap.add_argument("--original_model", default=None, help="원본 모델 경로 (없으면 base_model 사용)")
+    ap.add_argument("--text_file", default=None, help="이거 주면 get_loaders 없이 txt로 평가(가장 안정적)")
 
     # LoRA (no-merge) 옵션
-    ap.add_argument("--lora_A", default=None, help="A stage adapter (콤마 구분 가능)")
-    ap.add_argument("--lora_AB", default=None, help="AB stage adapter (콤마 구분 가능)")
-    ap.add_argument("--lora_FULL", default=None, help="FULL stage adapter (콤마 구분 가능)")
+    ap.add_argument("--lora_A", default=None, help="A stage adapter dir (comma-separated => each evaluated separately)")
+    ap.add_argument("--lora_AB", default=None, help="AB stage adapter dir (comma-separated => each evaluated separately)")
+    ap.add_argument("--lora_FULL", default=None, help="FULL stage adapter dir (comma-separated => each evaluated separately)")
 
     args = ap.parse_args()
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    # Qwen 토크나이저 로드 (trust_remote_code 필요)
-    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=False, trust_remote_code=True)
-    
-    # Qwen은 pad_token이 없을 수 있으므로 처리
-    # Qwen 토크나이저는 add_special_tokens를 지원하지 않으므로 직접 할당
+    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if tok.pad_token is None:
-        if tok.eos_token is not None:
-            tok.pad_token = tok.eos_token
-            tok.pad_token_id = tok.eos_token_id
-            print(f"[INFO] pad_token을 eos_token으로 설정: '{tok.eos_token}' (id={tok.eos_token_id})")
-        else:
-            # eos도 없으면 임베딩 테이블의 마지막 토큰 사용
-            tok.pad_token_id = len(tok) - 1
-            print(f"[WARN] eos_token도 없음. pad_token_id를 {tok.pad_token_id}로 설정")
-    
-    print(f"[INFO] Tokenizer vocab_size: {len(tok)}")
+        tok.pad_token = tok.eos_token
 
     def make_raw_loader():
         if args.text_file is not None:
@@ -774,6 +733,7 @@ def main():
         if GET_LOADERS is None:
             raise RuntimeError("get_loaders import 실패. --text_file로 평가하거나 get_loaders 경로를 맞춰줘야 해요.")
 
+        # get_loaders 시그니처가 레포마다 달라서 여러 패턴 try
         try:
             raw = GET_LOADERS(args.dataset, tok, seqlen=args.seqlen, nsamples=args.nsamples, seed=args.seed, split=args.split)
         except TypeError:
@@ -784,96 +744,29 @@ def main():
 
         return _pick_split(raw, args.split)
 
-    # ========================================
-    # 원본 모델 평가 (옵션)
-    # ========================================
-    if args.eval_original:
-        original_model_path = args.original_model if args.original_model else args.base_model
-        
-        print("\n" + "="*80)
-        print("ORIGINAL MODEL EVALUATION")
-        print("="*80)
-        print(f"Model: {original_model_path}")
-        
-        try:
-            orig_model = _load_model(original_model_path, dtype=dtype, device=args.device)
-            orig_model.eval()
-            
-            # 데이터 로더 준비
-            raw_loader = make_raw_loader()
-            batches = list(
-                _normalize_loader_to_batches(
-                    raw_loader=raw_loader,
-                    tok=tok,
-                    seqlen=args.seqlen,
-                    batch_size=args.batch_size,
-                    device=args.device,
-                    max_batches=args.max_batches,
-                )
-            )
-            
-            print(f"\n[INFO] Evaluating original model with {len(batches)} batches...")
-            m_orig = eval_ppl(orig_model, iter(batches))
-            
-            print("\n" + "-"*80)
-            print("ORIGINAL MODEL RESULTS:")
-            print(f"  PPL:      {m_orig['ppl']:.6f}")
-            print(f"  Mean NLL: {m_orig['mean_nll']:.6f}")
-            print(f"  Tokens:   {m_orig['tokens']}")
-            print("-"*80 + "\n")
-            
-            del orig_model
-            if args.device.startswith("cuda"):
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"[ERROR] 원본 모델 평가 실패: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ========================================
-    # 프루닝 모델 평가 (A / AB / FULL)
-    # ========================================
-    print("\n" + "="*80)
-    print("PRUNED MODEL EVALUATION")
-    print("="*80)
-
     # stage별 평가
     for stage, label in [("A", "A"), ("AB", "AB"), ("FULL", "ABC")]:
-        # stage마다 fresh load (LoRA 오염 방지)
-        print(f"\n{'='*60}")
-        print(f"Loading model for stage: {stage}")
-        print(f"{'='*60}")
-        
+        # ✅ stage마다 fresh load (LoRA in-place 변형/오염 방지)
         model = _load_model(args.base_model, dtype=dtype, device=args.device)
         model.eval()
 
         passlayer_return_tuple = _detect_layer_return_tuple(model)
-        
-        try:
-            mgr = DynamicStageManager(
-                model=model,
-                bundles_dir=Path(args.bundles_dir),
-                device=args.device,
-                dtype=dtype,
-                passlayer_return_tuple=passlayer_return_tuple,
-            )
-            mgr.set_stage(stage)
-        except Exception as e:
-            print(f"[ERROR] Stage {stage} 설정 실패: {e}")
-            del model
-            if args.device.startswith("cuda"):
-                torch.cuda.empty_cache()
-            continue
+        mgr = DynamicStageManager(
+            model=model,
+            bundles_dir=Path(args.bundles_dir),
+            device=args.device,
+            dtype=dtype,
+            passlayer_return_tuple=passlayer_return_tuple,
+        )
+        mgr.set_stage(stage)
 
-        # 첫 stage에서만 메타 출력
+        # 그룹 메타는 첫 stage에서만 출력
         if stage == "A":
-            print("\n=== Qwen MODEL META ===")
+            print("\n=== GROUP META ===")
             print(mgr.stage_meta())
-            print(f"device={args.device} dtype={args.dtype}")
-            print(f"vocab_size={len(tok)}\n")
+            print(f"device={args.device} dtype={args.dtype}\n")
 
-        # 동일 데이터로 base vs lora 공정 비교
+        # ✅ 동일 데이터로 base vs lora를 공정 비교하려고 배치를 한번 만들어 캐싱
         raw_loader = make_raw_loader()
         batches = list(
             _normalize_loader_to_batches(
@@ -888,34 +781,26 @@ def main():
 
         # 1) base ppl
         m_base = eval_ppl(model, iter(batches))
-        print(f"\n{'─'*60}")
-        print(f"[{label}] BASE (Pruned Model)")
-        print(f"{'─'*60}")
-        print(f"  PPL:      {m_base['ppl']:.6f}")
-        print(f"  Mean NLL: {m_base['mean_nll']:.6f}")
-        print(f"  Tokens:   {m_base['tokens']}")
-        print(f"{'─'*60}")
+        print(f"[{label}] BASE ppl={m_base['ppl']:.6f} | mean_nll={m_base['mean_nll']:.6f} | tokens={m_base['tokens']}")
 
-        # 2) lora ppl (no-merge, 각각 따로 평가)
+        # 2) lora ppl (no-merge)
         lora_spec = {"A": args.lora_A, "AB": args.lora_AB, "FULL": args.lora_FULL}[stage]
         lora_paths = _parse_lora_list(lora_spec)
 
+        # 콤마로 여러 개면 "각각 따로" 평가 (누적 적용 아님)
         for p in lora_paths:
             model_lora = _apply_lora_no_merge(model, p)
             m_lora = eval_ppl(model_lora, iter(batches))
-            print(f"\n[{label}] + LoRA: {Path(p).name}")
-            print(f"  PPL:      {m_lora['ppl']:.6f}")
-            print(f"  Mean NLL: {m_lora['mean_nll']:.6f}")
-            print(f"  Tokens:   {m_lora['tokens']}")
+            print(
+                f"[{label}] LoRA({Path(p).name}) ppl={m_lora['ppl']:.6f} | mean_nll={m_lora['mean_nll']:.6f} | tokens={m_lora['tokens']}"
+            )
             del model_lora
 
         del model
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
-    print("\n" + "="*80)
-    print("EVALUATION COMPLETE")
-    print("="*80)
+    print("\nDone.")
 
 
 if __name__ == "__main__":

@@ -178,6 +178,8 @@ kd_lora_results/
 data/
 qwen_results/
 llama2_7b_merged_models/
+merged_models_llama2_7b/
+merged_models_mistral_7b/
 
 A/
 bundles/
