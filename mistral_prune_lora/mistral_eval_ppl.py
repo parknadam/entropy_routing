@@ -8,23 +8,16 @@
 # Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
 # lora 어댑터
+CUDA_VISIBLE_DEVICES=4 \
 python -m mistral_prune_lora.mistral_eval_ppl \
      --base_model ./25_mistral_results/pruning/A \
      --bundles_dir ./25_mistral_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
-     --device cuda:2 --dtype bf16 \
-     --lora_A   ./mistral_results/adapters/A_lora/stageA \
+     --dtype bf16 \
+     --lora_A   ./mistral_kd_lora_results/adapters/A_lora/stageA \
      --lora_AB  ./mistral_lora/adapters/stageAB \
      --lora_FULL ./mistral_lora/adapters/stageFULL
-
-python -m mistral_prune_lora.mistral_eval_ppl \
-     --base_model ./merged_models_mistral_7b/A_merged \
-     --bundles_dir ./25_mistral_results/pruning/bundles \
-     --text_file ./data/wikitext2_test.txt \
-     --seqlen 1024 --batch_size 1 --max_batches 64 \
-     --device cuda:3 --dtype bf16
-
 
 """
    

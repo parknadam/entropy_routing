@@ -8,6 +8,7 @@ Stage 매핑:
 - C:   A + B + C layers 복원 (internal stage: FULL)
 
 사용 예시:
+CUDA_VISIBLE_DEVICES=4 \
 python -m mistral_prune_lora.mistral_stage_chat \
   --base_model ./25_mistral_results/pruning/A \
   --bundles_dir ./25_mistral_results/pruning/bundles \
