@@ -1,47 +1,20 @@
-# prune_lora/eval_ppl.py
+# falcon_prune_lora/falcon_eval_ppl.py
 # A / AB / ABC(FULL) stage별 "corpus perplexity" 평가 + (옵션) LoRA 어댑터(merge 없이) 얹어서 ppl 평가
-# 즉 모델 + lora 어댑터
-# - user prompt 말고, dataset/text_file로 perplexity를 측정
-# - loader가 dict/tuple(tensor,tensor)/tensor/str(line) 어떤 형태로 나오든 처리
-# - LoRA는 merge 없이 PeftModel로 감싼 채 평가 (stage마다 모델 fresh load로 오염 방지)
+# Falcon 모델 구조 대응
 #
-# Usage (텍스트 파일로 강제 평가; 가장 안정적)
+# Usage (텍스트 파일로 평가; 가장 안정적)
 """
-# A_merged ppl
-python -m prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages A
-
-# B_merged ppl
-python -m prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
-  --bundle_B_dir ./merged_models/B_merged \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages AB
-
-# C_merged ppl
-python -m llama_prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
-  --bundle_B_dir ./merged_models/B_merged \
-  --bundle_C_dir ./merged_models/C_merged \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages FULL
-
-
+CUDA_VISIBLE_DEVICES=6 \
+python -m falcon_prune_lora.falcon_eval_ppl \
+     --base_model ./falcon_results/pruning/A \
+     --bundles_dir ./falcon_results/pruning/bundles \
+     --text_file ./data/wikitext2_test.txt \
+     --seqlen 1024 --batch_size 1 --max_batches 64 \
+     --dtype bf16 \
+     --lora_A   ./falcon_lora/adapters/stageA \
+     --lora_AB  ./falcon_lora/adapters/stageAB \
+     --lora_FULL ./falcon_lora/adapters/stageFULL
 """
-   
-# Note:
-# - --lora_*에 콤마(,)로 여러 경로를 주면, "각 어댑터를 따로" 평가합니다. (누적 적용 아님)
 
 from __future__ import annotations
 
@@ -72,10 +45,8 @@ except Exception:
 # -----------------------------
 def _try_import_get_loaders():
     cands = [
-        "prune_lora.pruning.data",
-        "prune_lora.pruning.lm_datasets",
-        "prune_lora.pruning.data_utils",
-        "prune_lora.pruning.dataset",
+        "falcon_prune_lora.pruning.data",
+        "pruning.data",
     ]
     for m in cands:
         try:
@@ -89,26 +60,39 @@ def _try_import_get_loaders():
 
 GET_LOADERS = _try_import_get_loaders()
 
+
 # -----------------------------
-# transformers 버전에 따라 LlamaDecoderLayer import 경로가 다름
+# Falcon DecoderLayer import
 # -----------------------------
 try:
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
 except Exception:
-    LlamaDecoderLayer = None
+    FalconDecoderLayer = None
 
 
-def _get_llama_layers(model) -> nn.ModuleList:
-    # base model
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return model.model.layers
-    # some wrappers
-    if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
-        return model.model.model.layers
-    raise RuntimeError("LLaMA layers 경로를 찾지 못했어요. (예: model.model.layers)")
+def _get_falcon_layers(model) -> nn.ModuleList:
+    """Falcon 모델의 디코더 레이어 리스트 반환 (다양한 wrapper 대응)"""
+    # FalconForCausalLM → FalconModel.h
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h
+    # PeftModel wrapping
+    if hasattr(model, "base_model"):
+        base = model.base_model
+        if hasattr(base, "model") and hasattr(base.model, "transformer"):
+            return base.model.transformer.h
+        if hasattr(base, "transformer"):
+            return base.transformer.h
+    # model.model.transformer.h (다중 래핑)
+    if hasattr(model, "model"):
+        if hasattr(model.model, "transformer") and hasattr(model.model.transformer, "h"):
+            return model.model.transformer.h
+    raise RuntimeError(
+        "Falcon layers 경로를 찾지 못했습니다. "
+        "(예상: model.transformer.h)"
+    )
 
 
-class LlamaPassLayer(nn.Module):
+class FalconPassLayer(nn.Module):
     def __init__(self, return_tuple: bool = True):
         super().__init__()
         self.return_tuple = return_tuple
@@ -116,21 +100,20 @@ class LlamaPassLayer(nn.Module):
     def forward(
         self,
         hidden_states,
+        alibi=None,
         attention_mask=None,
         position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
+        layer_past=None,
+        head_mask=None,
         use_cache=False,
-        cache_position=None,
+        output_attentions=False,
         **kwargs,
     ):
         if not self.return_tuple:
             return hidden_states
         outputs = (hidden_states,)
-        if output_attentions:
-            outputs = outputs + (None,)
         if use_cache:
-            outputs = outputs + (past_key_value,)
+            outputs = outputs + (layer_past,)
         return outputs
 
 
@@ -140,11 +123,11 @@ def _detect_layer_return_tuple(model) -> bool:
     PassLayer도 동일한 형태로 맞춰주기 위한 휴리스틱.
     """
     try:
-        core = model.model if hasattr(model, "model") else model
+        core = model.transformer if hasattr(model, "transformer") else model
         src = inspect.getsource(core.forward)
-        if "layer_outputs[0]" in src or "layer_outputs = decoder_layer" in src:
+        if "layer_outputs[0]" in src or "outputs = layer(" in src:
             return True
-        if "hidden_states = decoder_layer" in src and "layer_outputs[0]" not in src:
+        if "hidden_states = layer(" in src and "layer_outputs" not in src:
             return False
     except Exception:
         pass
@@ -167,11 +150,12 @@ def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
 
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
+    """번들 파일의 키에서 레이어 prefix를 제거"""
     out = {}
     needles = [
-        f"model.layers.{layer_idx}.",
-        f"model.model.layers.{layer_idx}.",
-        f"layers.{layer_idx}.",
+        f"transformer.h.{layer_idx}.",
+        f"model.transformer.h.{layer_idx}.",
+        f"h.{layer_idx}.",
     ]
     for k, v in sd.items():
         nk = k
@@ -222,14 +206,15 @@ class DynamicStageManager:
         device: str,
         dtype: torch.dtype,
         passlayer_return_tuple: bool,
-        B_dir: Optional[Path] = None,   # ✅ 추가
-        C_dir: Optional[Path] = None,   # ✅ 추가
     ):
-        if LlamaDecoderLayer is None:
-            raise RuntimeError("LlamaDecoderLayer import 실패 (llama 모델/transformers 버전 확인).")
+        if FalconDecoderLayer is None:
+            raise RuntimeError(
+                "FalconDecoderLayer import 실패. "
+                "transformers 버전을 확인하세요. (pip install -U transformers)"
+            )
 
         self.model = model
-        self.layers = _get_llama_layers(model)
+        self.layers = _get_falcon_layers(model)
         self.device = device
         self.dtype = dtype
         self.passlayer_return_tuple = passlayer_return_tuple
@@ -240,7 +225,9 @@ class DynamicStageManager:
 
         B_raw = _build_layer_map(self.B_dir)
         C_raw = _build_layer_map(self.C_dir)
-        self.B_map, self.C_map, self.index_shift = _maybe_shift_indices_to_zero_based(B_raw, C_raw, self.num_layers)
+        self.B_map, self.C_map, self.index_shift = _maybe_shift_indices_to_zero_based(
+            B_raw, C_raw, self.num_layers
+        )
 
         self.B_idx = sorted(self.B_map.keys())
         self.C_idx = sorted(self.C_map.keys())
@@ -269,10 +256,11 @@ class DynamicStageManager:
         if p is None:
             raise FileNotFoundError(f"layer_{layer_i}.safetensors not found in B/C.")
 
+        # FalconDecoderLayer 생성
         try:
-            new_layer = LlamaDecoderLayer(self.model.config, layer_i)
+            new_layer = FalconDecoderLayer(self.model.config, layer_i)
         except TypeError:
-            new_layer = LlamaDecoderLayer(self.model.config)
+            new_layer = FalconDecoderLayer(self.model.config)
 
         new_layer = new_layer.to(self.device, dtype=self.dtype)
 
@@ -280,8 +268,7 @@ class DynamicStageManager:
         sd = _strip_layer_prefix(sd, layer_i)
 
         missing, unexpected = new_layer.load_state_dict(sd, strict=False)
-        if (len(missing) > 0 or len(unexpected) > 0):
-            # 너무 시끄럽게 출력하긴 싫어서 warn 정도만
+        if len(missing) > 0 or len(unexpected) > 0:
             print(f"[WARN] layer {layer_i}: missing={len(missing)} unexpected={len(unexpected)}")
 
         old = self.layers[layer_i]
@@ -290,7 +277,9 @@ class DynamicStageManager:
 
     def _pass_one_layer(self, layer_i: int):
         old = self.layers[layer_i]
-        self.layers[layer_i] = LlamaPassLayer(return_tuple=self.passlayer_return_tuple).to(self.device)
+        self.layers[layer_i] = FalconPassLayer(
+            return_tuple=self.passlayer_return_tuple
+        ).to(self.device)
         del old
 
     def set_stage(self, stage: str):
@@ -307,7 +296,7 @@ class DynamicStageManager:
 
         for i in self.removed:
             cur = self.layers[i]
-            is_pass = isinstance(cur, LlamaPassLayer)
+            is_pass = isinstance(cur, FalconPassLayer)
             if i in pass_set:
                 if not is_pass:
                     self._pass_one_layer(i)
@@ -339,12 +328,6 @@ def _extract_batch(
     device: str,
     seqlen: int,
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """
-    Returns dict:
-      - input_ids [B,T]
-      - attention_mask [B,T]
-      - labels [B,T] (optional; -100 supported)
-    """
     # 1) dict
     if isinstance(batch, dict):
         if "input_ids" in batch:
@@ -356,7 +339,6 @@ def _extract_batch(
                 return None
             input_ids = _ensure_2d(input_ids)
 
-            # optional: 너무 길면 잘라서 안정화
             if input_ids.size(1) > seqlen:
                 input_ids = input_ids[:, :seqlen]
 
@@ -369,7 +351,6 @@ def _extract_batch(
                 if attn.size(1) > input_ids.size(1):
                     attn = attn[:, : input_ids.size(1)]
                 elif attn.size(1) < input_ids.size(1):
-                    # 부족하면 1로 패딩
                     pad = torch.ones((attn.size(0), input_ids.size(1) - attn.size(1)), dtype=attn.dtype)
                     attn = torch.cat([attn, pad], dim=1)
                 attn = attn.to(device)
@@ -380,11 +361,12 @@ def _extract_batch(
                 if labels.size(1) > input_ids.size(1):
                     labels = labels[:, : input_ids.size(1)]
                 elif labels.size(1) < input_ids.size(1):
-                    pad = torch.full((labels.size(0), input_ids.size(1) - labels.size(1)), -100, dtype=labels.dtype)
+                    pad = torch.full(
+                        (labels.size(0), input_ids.size(1) - labels.size(1)), -100, dtype=labels.dtype
+                    )
                     labels = torch.cat([labels, pad], dim=1)
                 out["labels"] = labels.to(device)
             return out
-
         return None
 
     # 2) tuple/list
@@ -439,9 +421,6 @@ def _pack_text_lines_to_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    """
-    loader가 str(라인)들을 뱉는 경우: tokenize해서 연속 토큰 스트림으로 붙인 뒤 seqlen 블록으로 잘라 배치 생성
-    """
     buf: List[int] = []
     made = 0
     cur_batch: List[torch.Tensor] = []
@@ -495,13 +474,6 @@ def _normalize_loader_to_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    """
-    raw_loader가:
-      - iterable of dict/tuple/tensor  -> extract_batch로 바로 처리
-      - iterable of str               -> pack_text_lines_to_batches로 처리
-      - str or list[str]             -> pack 처리
-      - torch.Tensor (whole corpus)  -> chunk 처리
-    """
     if isinstance(raw_loader, str):
         return _pack_text_lines_to_batches(iter([raw_loader]), tok, seqlen, batch_size, device, max_batches)
 
@@ -538,13 +510,11 @@ def _normalize_loader_to_batches(
         return iter([])
 
     if isinstance(first, str):
-
         def _lines():
             yield first
             for x in it:
                 if isinstance(x, str):
                     yield x
-
         return _pack_text_lines_to_batches(_lines(), tok, seqlen, batch_size, device, max_batches)
 
     def _batches():
@@ -573,11 +543,6 @@ def _normalize_loader_to_batches(
 # -----------------------------
 @torch.no_grad()
 def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, float]:
-    """
-    Token-weighted NLL / PPL.
-    If labels exist (-100 allowed), use them directly.
-    Else do next-token shift on input_ids.
-    """
     sum_nll = 0.0
     sum_tok = 0
 
@@ -591,18 +556,15 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
         if attn.dim() != 2:
             attn = _ensure_2d(attn)
 
-        # case 1) labels provided: cross_entropy(ignore_index=-100)
+        # case 1) labels provided
         if labels is not None:
             if labels.dim() != 2:
                 labels = _ensure_2d(labels)
-
-            # ✅ attention_mask=0인 곳은 loss에서 제외되도록 -100 처리
-            if attn is not None:
-                labels = labels.clone()
-                labels[attn == 0] = -100
+            labels = labels.clone()
+            labels[attn == 0] = -100
 
             out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-            logits = out.logits  # [B,T,V]
+            logits = out.logits
             V = logits.size(-1)
 
             loss_sum = F.cross_entropy(
@@ -616,12 +578,12 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
             sum_tok += int(tok_cnt)
             continue
 
-        # case 2) no labels: next-token shift with attention_mask
+        # case 2) no labels: next-token shift
         if input_ids.shape[1] < 2:
             continue
 
         out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-        logits = out.logits  # [B,T,V]
+        logits = out.logits
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
@@ -646,19 +608,27 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
 
 
 def _load_model(base_model: str, dtype: torch.dtype, device: str):
-    # transformers 버전별 호환
+    """Falcon 모델 로드 (trust_remote_code 없이 native HF 사용)"""
     try:
-        model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, low_cpu_mem_usage=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
+        )
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, low_cpu_mem_usage=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model, torch_dtype=dtype, low_cpu_mem_usage=True
+            )
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model, dtype=dtype, low_cpu_mem_usage=True
+            )
     return model.to(device)
 
 
 def _pick_split(obj: Any, split: str) -> Any:
-    """
-    get_loaders 반환이 (train, test) / dict / single 인 경우 대응.
-    split 선택 결과가 str로 떨어지면(가끔 키가 텍스트로 들어감) 다른 후보로 스왑 시도.
-    """
     if isinstance(obj, dict):
         if split in obj:
             return obj[split]
@@ -708,15 +678,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_batches", type=int, default=None)
 
-    ap.add_argument("--text_file", default=None, help="이거 주면 get_loaders 없이 txt로 평가(가장 안정적)")
+    ap.add_argument("--text_file", default=None, help="txt 파일로 평가 (가장 안정적)")
 
     # LoRA (no-merge) 옵션
-    ap.add_argument("--lora_A", default=None, help="A stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--lora_AB", default=None, help="AB stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--lora_FULL", default=None, help="FULL stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--bundle_B_dir", default=None, help="B 번들 폴더 override (e.g., ./merged_models/bundles/B_merged)")
-    ap.add_argument("--bundle_C_dir", default=None, help="C 번들 폴더 override (optional)")
-    ap.add_argument("--stages", default="A,AB,FULL", help="comma-separated stages: A,AB,FULL")
+    ap.add_argument("--lora_A", default=None)
+    ap.add_argument("--lora_AB", default=None)
+    ap.add_argument("--lora_FULL", default=None)
 
     args = ap.parse_args()
 
@@ -739,28 +706,29 @@ def main():
             )
 
         if GET_LOADERS is None:
-            raise RuntimeError("get_loaders import 실패. --text_file로 평가하거나 get_loaders 경로를 맞춰줘야 해요.")
+            raise RuntimeError(
+                "get_loaders import 실패. --text_file로 평가하거나 get_loaders 경로를 맞춰줘야 합니다."
+            )
 
-        # get_loaders 시그니처가 레포마다 달라서 여러 패턴 try
         try:
-            raw = GET_LOADERS(args.dataset, tok, seqlen=args.seqlen, nsamples=args.nsamples, seed=args.seed, split=args.split)
+            raw = GET_LOADERS(
+                args.dataset, tok, seqlen=args.seqlen,
+                nsamples=args.nsamples, seed=args.seed, split=args.split,
+            )
         except TypeError:
             try:
                 raw = GET_LOADERS(args.dataset, tok, args.seqlen, args.nsamples, args.seed)
             except TypeError:
-                raw = GET_LOADERS(args.dataset, nsamples=args.nsamples, seed=args.seed, seqlen=args.seqlen, tokenizer=tok)
+                raw = GET_LOADERS(
+                    args.dataset, nsamples=args.nsamples, seed=args.seed,
+                    seqlen=args.seqlen, tokenizer=tok,
+                )
 
         return _pick_split(raw, args.split)
 
     # stage별 평가
-    stage_list = [s.strip().upper() for s in args.stages.split(",") if s.strip()]
-    label_map = {"A": "A", "AB": "AB", "FULL": "ABC"}
-
-    for stage in stage_list:
-        if stage not in ("A", "AB", "FULL"):
-            raise ValueError(f"Invalid stage in --stages: {stage} (use A,AB,FULL)")
-        label = label_map[stage]
-    # ✅ stage마다 fresh load (LoRA in-place 변형/오염 방지)
+    for stage, label in [("A", "A"), ("AB", "AB"), ("FULL", "ABC")]:
+        # stage마다 fresh load (LoRA in-place 오염 방지)
         model = _load_model(args.base_model, dtype=dtype, device=args.device)
         model.eval()
 
@@ -771,20 +739,15 @@ def main():
             device=args.device,
             dtype=dtype,
             passlayer_return_tuple=passlayer_return_tuple,
-            B_dir=Path(args.bundle_B_dir) if args.bundle_B_dir else None,  # ✅ 추가
-            C_dir=Path(args.bundle_C_dir) if args.bundle_C_dir else None,  # ✅ 추가
         )
-
-
         mgr.set_stage(stage)
 
-        # 그룹 메타는 첫 stage에서만 출력
         if stage == "A":
             print("\n=== GROUP META ===")
             print(mgr.stage_meta())
             print(f"device={args.device} dtype={args.dtype}\n")
 
-        # ✅ 동일 데이터로 base vs lora를 공정 비교하려고 배치를 한번 만들어 캐싱
+        # 배치 캐싱 (base vs lora 공정 비교)
         raw_loader = make_raw_loader()
         batches = list(
             _normalize_loader_to_batches(
@@ -799,18 +762,21 @@ def main():
 
         # 1) base ppl
         m_base = eval_ppl(model, iter(batches))
-        print(f"[{label}] BASE ppl={m_base['ppl']:.6f} | mean_nll={m_base['mean_nll']:.6f} | tokens={m_base['tokens']}")
+        print(
+            f"[{label}] BASE ppl={m_base['ppl']:.6f} | "
+            f"mean_nll={m_base['mean_nll']:.6f} | tokens={m_base['tokens']}"
+        )
 
         # 2) lora ppl (no-merge)
         lora_spec = {"A": args.lora_A, "AB": args.lora_AB, "FULL": args.lora_FULL}[stage]
         lora_paths = _parse_lora_list(lora_spec)
 
-        # 콤마로 여러 개면 "각각 따로" 평가 (누적 적용 아님)
         for p in lora_paths:
             model_lora = _apply_lora_no_merge(model, p)
             m_lora = eval_ppl(model_lora, iter(batches))
             print(
-                f"[{label}] LoRA({Path(p).name}) ppl={m_lora['ppl']:.6f} | mean_nll={m_lora['mean_nll']:.6f} | tokens={m_lora['tokens']}"
+                f"[{label}] LoRA({Path(p).name}) ppl={m_lora['ppl']:.6f} | "
+                f"mean_nll={m_lora['mean_nll']:.6f} | tokens={m_lora['tokens']}"
             )
             del model_lora
 

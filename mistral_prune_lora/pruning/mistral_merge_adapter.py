@@ -6,9 +6,9 @@ LoRA 어댑터를 Mistral 베이스 모델에 머지하는 유틸리티.
 # A 단일 머지
 python -m mistral_prune_lora.pruning.mistral_merge_adapter \
   --base_model ./25_mistral_results/pruning/A \
-  --adapter_path ./mistral_results/adapters/A_lora/stageA \
+  --adapter_path ./mistral_kd_lora_results/adapters/A_lora/stageA/stageA \
   --output_dir ./merged_models_mistral_7b/A_merged \
-  --device cuda:3
+  --device cuda:0
 
 # 여러 어댑터 순차 머지 (예: A_merged + B_lora + C_lora)
 python -m mistral_prune_lora.pruning.mistral_merge_adapter \

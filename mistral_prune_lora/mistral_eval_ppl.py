@@ -15,7 +15,7 @@ python -m mistral_prune_lora.mistral_eval_ppl \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --dtype bf16 \
-     --lora_A   ./mistral_kd_lora_results/adapters/A_lora/stageA \
+     --lora_A   ./mistral_kd_lora_results/adapters/A_lora/stageA/stageA \
      --lora_AB  ./mistral_lora/adapters/stageAB \
      --lora_FULL ./mistral_lora/adapters/stageFULL
 

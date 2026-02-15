@@ -3,7 +3,7 @@
 Mistral 구조용 최적화 KD-LoRA 학습 코드
 
 사용법:
-CUDA_VISIBLE_DEVICES=3,4 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
 python -m mistral_prune_lora.mistral_optimized_kd_lora \
   --base_dir ./25_mistral_results/pruning/A \
   --bundles_dir ./25_mistral_results/pruning/bundles \

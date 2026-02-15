@@ -5,7 +5,7 @@
 
 python -m falcon_prune_lora.pruning.layeronly_drop \
   --model tiiuae/falcon-7b-instruct \
-  --device cuda:2 \
+  --device cuda:6 \
   --drop_frac 0.25 \
   --keep_last_layer \
   --nsamples 64 \
@@ -63,7 +63,6 @@ def _load_model(model_name: str, seqlen: int, device_str: str):
     tok = AutoTokenizer.from_pretrained(
         model_name,
         use_fast=True,
-        trust_remote_code=True,  # Falcon 모델은 trust_remote_code 필요할 수 있음
     )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -71,10 +70,9 @@ def _load_model(model_name: str, seqlen: int, device_str: str):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map=None,
-        trust_remote_code=True,  # Falcon 모델 필수
         attn_implementation="eager",  # CUDA ext 없어도 동작
     ).to(device_str)
     model.seqlen = seqlen

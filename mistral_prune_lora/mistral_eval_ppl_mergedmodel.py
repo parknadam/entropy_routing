@@ -1,4 +1,4 @@
-# prune_lora/eval_ppl.py
+# mistral_prune_lora/mistral_eval_ppl_mergedmodel.py
 # A / AB / ABC(FULL) stage별 "corpus perplexity" 평가 + (옵션) LoRA 어댑터(merge 없이) 얹어서 ppl 평가
 # 즉 모델 + lora 어댑터
 # - user prompt 말고, dataset/text_file로 perplexity를 측정
@@ -8,30 +8,30 @@
 # Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
 # A_merged ppl
-python -m prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --base_model ./merged_models_mistral_7b/A_merged \
+  --bundles_dir ./25_mistral_results/pruning/bundles \
   --text_file ./data/wikitext2_test.txt \
   --seqlen 1024 --batch_size 1 --max_batches 64 \
   --device cuda:0 --dtype bf16 \
   --stages A
 
 # B_merged ppl
-python -m prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
-  --bundle_B_dir ./merged_models/B_merged \
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --base_model ./merged_models_mistral_7b/A_merged \
+  --bundles_dir ./25_mistral_results/pruning/bundles \
+  --bundle_B_dir ./merged_models_mistral_7b/B_merged \
   --text_file ./data/wikitext2_test.txt \
   --seqlen 1024 --batch_size 1 --max_batches 64 \
   --device cuda:0 --dtype bf16 \
   --stages AB
 
 # C_merged ppl
-python -m llama_prune_lora.eval_ppl_mergedmodel \
-  --base_model ./merged_models/A_merged \
-  --bundles_dir ./7b_results/pruning/bundles \
-  --bundle_B_dir ./merged_models/B_merged \
-  --bundle_C_dir ./merged_models/C_merged \
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --base_model ./merged_models_mistral_7b/A_merged \
+  --bundles_dir ./25_mistral_results/pruning/bundles \
+  --bundle_B_dir ./merged_models_mistral_7b/B_merged \
+  --bundle_C_dir ./merged_models_mistral_7b/C_merged \
   --text_file ./data/wikitext2_test.txt \
   --seqlen 1024 --batch_size 1 --max_batches 64 \
   --device cuda:0 --dtype bf16 \
@@ -48,9 +48,42 @@ from __future__ import annotations
 import argparse
 import inspect
 import math
+import os
 import re
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Iterator, Any, List
+
+
+def _is_usable_tmpdir(path: Optional[str]) -> bool:
+    if not path:
+        return False
+    return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
+
+
+def _ensure_tmpdir() -> None:
+    """
+    /tmp가 막힌 환경에서도 torch import가 가능하도록 임시 디렉터리를 보장한다.
+    """
+    env_tmp = os.environ.get("TMPDIR")
+    if _is_usable_tmpdir(env_tmp):
+        return
+
+    for cand in ("/tmp", "/var/tmp", "/usr/tmp"):
+        if _is_usable_tmpdir(cand):
+            os.environ["TMPDIR"] = cand
+            os.environ["TMP"] = cand
+            os.environ["TEMP"] = cand
+            return
+
+    local_tmp = (Path.cwd() / ".tmp").resolve()
+    local_tmp.mkdir(parents=True, exist_ok=True)
+    local_tmp_str = str(local_tmp)
+    os.environ["TMPDIR"] = local_tmp_str
+    os.environ["TMP"] = local_tmp_str
+    os.environ["TEMP"] = local_tmp_str
+
+
+_ensure_tmpdir()
 
 import torch
 import torch.nn as nn
@@ -72,10 +105,11 @@ except Exception:
 # -----------------------------
 def _try_import_get_loaders():
     cands = [
-        "prune_lora.pruning.data",
-        "prune_lora.pruning.lm_datasets",
-        "prune_lora.pruning.data_utils",
-        "prune_lora.pruning.dataset",
+        "mistral_prune_lora.pruning.data",
+        "pruning.data",
+        "mistral_prune_lora.pruning.lm_datasets",
+        "mistral_prune_lora.pruning.data_utils",
+        "mistral_prune_lora.pruning.dataset",
     ]
     for m in cands:
         try:
@@ -90,25 +124,25 @@ def _try_import_get_loaders():
 GET_LOADERS = _try_import_get_loaders()
 
 # -----------------------------
-# transformers 버전에 따라 LlamaDecoderLayer import 경로가 다름
+# transformers 버전에 따라 MistralDecoderLayer import 경로가 다름
 # -----------------------------
 try:
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 except Exception:
-    LlamaDecoderLayer = None
+    MistralDecoderLayer = None
 
 
-def _get_llama_layers(model) -> nn.ModuleList:
+def _get_mistral_layers(model) -> nn.ModuleList:
     # base model
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
     # some wrappers
     if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
         return model.model.model.layers
-    raise RuntimeError("LLaMA layers 경로를 찾지 못했어요. (예: model.model.layers)")
+    raise RuntimeError("Mistral layers 경로를 찾지 못했어요. (예: model.model.layers)")
 
 
-class LlamaPassLayer(nn.Module):
+class MistralPassLayer(nn.Module):
     def __init__(self, return_tuple: bool = True):
         super().__init__()
         self.return_tuple = return_tuple
@@ -225,18 +259,18 @@ class DynamicStageManager:
         B_dir: Optional[Path] = None,   # ✅ 추가
         C_dir: Optional[Path] = None,   # ✅ 추가
     ):
-        if LlamaDecoderLayer is None:
-            raise RuntimeError("LlamaDecoderLayer import 실패 (llama 모델/transformers 버전 확인).")
+        if MistralDecoderLayer is None:
+            raise RuntimeError("MistralDecoderLayer import 실패 (mistral 모델/transformers 버전 확인).")
 
         self.model = model
-        self.layers = _get_llama_layers(model)
+        self.layers = _get_mistral_layers(model)
         self.device = device
         self.dtype = dtype
         self.passlayer_return_tuple = passlayer_return_tuple
 
         self.num_layers = len(self.layers)
-        self.B_dir = bundles_dir / "B"
-        self.C_dir = bundles_dir / "C"
+        self.B_dir = B_dir if B_dir is not None else (bundles_dir / "B")
+        self.C_dir = C_dir if C_dir is not None else (bundles_dir / "C")
 
         B_raw = _build_layer_map(self.B_dir)
         C_raw = _build_layer_map(self.C_dir)
@@ -270,9 +304,9 @@ class DynamicStageManager:
             raise FileNotFoundError(f"layer_{layer_i}.safetensors not found in B/C.")
 
         try:
-            new_layer = LlamaDecoderLayer(self.model.config, layer_i)
+            new_layer = MistralDecoderLayer(self.model.config, layer_i)
         except TypeError:
-            new_layer = LlamaDecoderLayer(self.model.config)
+            new_layer = MistralDecoderLayer(self.model.config)
 
         new_layer = new_layer.to(self.device, dtype=self.dtype)
 
@@ -290,7 +324,7 @@ class DynamicStageManager:
 
     def _pass_one_layer(self, layer_i: int):
         old = self.layers[layer_i]
-        self.layers[layer_i] = LlamaPassLayer(return_tuple=self.passlayer_return_tuple).to(self.device)
+        self.layers[layer_i] = MistralPassLayer(return_tuple=self.passlayer_return_tuple).to(self.device)
         del old
 
     def set_stage(self, stage: str):
@@ -307,7 +341,7 @@ class DynamicStageManager:
 
         for i in self.removed:
             cur = self.layers[i]
-            is_pass = isinstance(cur, LlamaPassLayer)
+            is_pass = isinstance(cur, MistralPassLayer)
             if i in pass_set:
                 if not is_pass:
                     self._pass_one_layer(i)
@@ -648,10 +682,39 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
 def _load_model(base_model: str, dtype: torch.dtype, device: str):
     # transformers 버전별 호환
     try:
-        model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, low_cpu_mem_usage=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager",
+        )
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, low_cpu_mem_usage=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, low_cpu_mem_usage=True)
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, low_cpu_mem_usage=True)
     return model.to(device)
+
+
+def _load_tokenizer(base_model: str):
+    """
+    fast tokenizer 우선, 실패 시 slow tokenizer로 폴백.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(base_model, use_fast=True)
+    except Exception as e_fast:
+        try:
+            tok = AutoTokenizer.from_pretrained(base_model, use_fast=False)
+            print(f"[INFO] fast tokenizer load failed -> fallback to slow tokenizer: {e_fast}")
+            return tok
+        except Exception as e_slow:
+            em = f"{e_fast}\n{e_slow}".lower()
+            hint = ""
+            if ("sentencepiece" in em) or ("tiktoken" in em):
+                hint = " Install dependencies: pip install sentencepiece tiktoken"
+            raise RuntimeError(
+                f"Tokenizer load failed for '{base_model}'. fast/slow tokenizer 모두 로드 실패.{hint}"
+            ) from e_slow
 
 
 def _pick_split(obj: Any, split: str) -> Any:
@@ -723,7 +786,7 @@ def main():
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
 
-    tok = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
+    tok = _load_tokenizer(args.base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
