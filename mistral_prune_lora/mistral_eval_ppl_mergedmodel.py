@@ -1,178 +1,297 @@
-# mistral_prune_lora/mistral_eval_ppl_mergedmodel.py
-# A / AB / ABC(FULL) stage별 "corpus perplexity" 평가 + (옵션) LoRA 어댑터(merge 없이) 얹어서 ppl 평가
-# 즉 모델 + lora 어댑터
-# - user prompt 말고, dataset/text_file로 perplexity를 측정
-# - loader가 dict/tuple(tensor,tensor)/tensor/str(line) 어떤 형태로 나오든 처리
-# - LoRA는 merge 없이 PeftModel로 감싼 채 평가 (stage마다 모델 fresh load로 오염 방지)
-#
-# Usage (텍스트 파일로 강제 평가; 가장 안정적)
+#!/usr/bin/env python3
 """
-# A_merged ppl
-python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
-  --base_model ./merged_models_mistral_7b/A_merged \
-  --bundles_dir ./25_mistral_results/pruning/bundles \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages A
+머지된 모델(pruned + LoRA merged)의 PPL을 평가하는 스크립트.
 
-# B_merged ppl
+평가 모드:
+  1) A-only (기본):  머지된 모델을 그대로 평가 (드롭된 레이어는 PassLayer → identity)
+  2) A/AB/FULL:      B/C 번들을 로드하여 stage별 비교 평가
+     - AB:   A_merged + B_merged (C는 PassLayer)
+     - FULL: A_merged + B_merged + C_merged
+
+A_merged 모델의 PassLayer에 대해:
+  - PassLayer는 hidden_states를 그대로 통과시키는 identity layer입니다.
+  - 따라서 A_merged 모델은 "프루닝 + LoRA 머지" 된 모델로 정상 추론/PPL 측정 가능합니다.
+  - AB/FULL 평가는 --bundles_dir 또는 --bundle_B_dir/--bundle_C_dir로 번들을 지정하세요.
+
+사용법:
+# A-only 평가 (단순)
 python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
-  --base_model ./merged_models_mistral_7b/A_merged \
+  --model_path ./merged_models_mistral_7b/A_merged \
+  --device cuda:0
+  --seqlen 1024
+
+# A/AB/FULL stage 비교 (기존 bundles/B,C 사용)
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --model_path ./merged_models_mistral_7b/A_merged \
   --bundles_dir ./25_mistral_results/pruning/bundles \
+  --stages A,AB,FULL \
+  --device cuda:0
+
+# A+AB 평가 (A_merged + B_merged, C=PassLayer)
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --model_path ./merged_models_mistral_7b/A_merged \
   --bundle_B_dir ./merged_models_mistral_7b/B_merged \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages AB
+  --stages A,AB \
+  --device cuda:0
 
-# C_merged ppl
+# FULL 평가 (A_merged + B_merged + C_merged)
 python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
-  --base_model ./merged_models_mistral_7b/A_merged \
-  --bundles_dir ./25_mistral_results/pruning/bundles \
+  --model_path ./merged_models_mistral_7b/A_merged \
   --bundle_B_dir ./merged_models_mistral_7b/B_merged \
   --bundle_C_dir ./merged_models_mistral_7b/C_merged \
-  --text_file ./data/wikitext2_test.txt \
-  --seqlen 1024 --batch_size 1 --max_batches 64 \
-  --device cuda:0 --dtype bf16 \
-  --stages FULL
+  --stages FULL \
+  --device cuda:0
 
+# 여러 머지 모델 비교
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --model_path ./merged_models/A_merged ./merged_models/AB_merged \
+  --device cuda:0
 
+# 원본 모델과 비교
+python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \
+  --model_path mistralai/Mistral-7B-v0.1 ./merged_models/A_merged \
+  --tokenizer_path mistralai/Mistral-7B-v0.1 \
+  --device cuda:0
 """
-   
-# Note:
-# - --lora_*에 콤마(,)로 여러 경로를 주면, "각 어댑터를 따로" 평가합니다. (누적 적용 아님)
 
 from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import math
 import os
+import random
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Iterator, Any, List
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-
-def _is_usable_tmpdir(path: Optional[str]) -> bool:
-    if not path:
-        return False
-    return os.path.isdir(path) and os.access(path, os.W_OK | os.X_OK)
-
-
-def _ensure_tmpdir() -> None:
-    """
-    /tmp가 막힌 환경에서도 torch import가 가능하도록 임시 디렉터리를 보장한다.
-    """
-    env_tmp = os.environ.get("TMPDIR")
-    if _is_usable_tmpdir(env_tmp):
-        return
-
-    for cand in ("/tmp", "/var/tmp", "/usr/tmp"):
-        if _is_usable_tmpdir(cand):
-            os.environ["TMPDIR"] = cand
-            os.environ["TMP"] = cand
-            os.environ["TEMP"] = cand
-            return
-
-    local_tmp = (Path.cwd() / ".tmp").resolve()
-    local_tmp.mkdir(parents=True, exist_ok=True)
-    local_tmp_str = str(local_tmp)
-    os.environ["TMPDIR"] = local_tmp_str
-    os.environ["TMP"] = local_tmp_str
-    os.environ["TEMP"] = local_tmp_str
-
-
-_ensure_tmpdir()
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# -----------------------------
-# PEFT (LoRA) optional import
-# -----------------------------
+# safetensors (for bundle loading)
 try:
-    from peft import PeftModel
-except Exception:
-    PeftModel = None
+    from safetensors.torch import load_file
+except ImportError:
+    load_file = None
 
-
-# -----------------------------
-# Try import project get_loaders (optional)
-# -----------------------------
-def _try_import_get_loaders():
-    cands = [
-        "mistral_prune_lora.pruning.data",
-        "pruning.data",
-        "mistral_prune_lora.pruning.lm_datasets",
-        "mistral_prune_lora.pruning.data_utils",
-        "mistral_prune_lora.pruning.dataset",
-    ]
-    for m in cands:
-        try:
-            mod = __import__(m, fromlist=["get_loaders"])
-            if hasattr(mod, "get_loaders"):
-                return getattr(mod, "get_loaders")
-        except Exception:
-            pass
-    return None
-
-
-GET_LOADERS = _try_import_get_loaders()
-
-# -----------------------------
-# transformers 버전에 따라 MistralDecoderLayer import 경로가 다름
-# -----------------------------
+# MistralDecoderLayer (for bundle restoration)
+MistralDecoderLayer = None
 try:
-    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-except Exception:
-    MistralDecoderLayer = None
+    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer as _MDL
+    MistralDecoderLayer = _MDL
+except ImportError:
+    pass
+
+# get_loaders import (optional)
+GET_LOADERS = None
+for _mod_name in [
+    "mistral_prune_lora.pruning.data",
+    "pruning.data",
+]:
+    try:
+        _mod = __import__(_mod_name, fromlist=["get_loaders"])
+        if hasattr(_mod, "get_loaders"):
+            GET_LOADERS = getattr(_mod, "get_loaders")
+            break
+    except Exception:
+        pass
+
+# peft (optional)
+PeftModel = None
+try:
+    from peft import PeftModel as _PM
+    PeftModel = _PM
+except ImportError:
+    pass
 
 
-def _get_mistral_layers(model) -> nn.ModuleList:
-    # base model
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return model.model.layers
-    # some wrappers
-    if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
-        return model.model.model.layers
-    raise RuntimeError("Mistral layers 경로를 찾지 못했어요. (예: model.model.layers)")
-
-
+# ============================================================
+# PassLayer
+# ============================================================
 class MistralPassLayer(nn.Module):
     def __init__(self, return_tuple: bool = True):
         super().__init__()
         self.return_tuple = return_tuple
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        cache_position=None,
-        **kwargs,
-    ):
+    def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                past_key_value=None, output_attentions=False, use_cache=False,
+                cache_position=None, **kwargs):
         if not self.return_tuple:
             return hidden_states
         outputs = (hidden_states,)
         if output_attentions:
-            outputs = outputs + (None,)
+            outputs += (None,)
         if use_cache:
-            outputs = outputs + (past_key_value,)
+            outputs += (past_key_value,)
         return outputs
 
 
+# ============================================================
+# manifest.json에서 dropped layers 읽기 + PassLayer 설치
+# ============================================================
+def _read_dropped_layers(model_path: str) -> List[int]:
+    """manifest.json에서 프루닝으로 제거된 레이어 인덱스를 읽습니다."""
+    manifest_path = os.path.join(model_path, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return []
+
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+    except Exception:
+        return []
+
+    # stages.A.dropped_layers (layeronly_drop.py 생성)
+    stages = manifest.get("stages", {})
+    dropped = stages.get("A", {}).get("dropped_layers", [])
+
+    # B + C removed_layers
+    if not dropped:
+        B_removed = stages.get("B", {}).get("removed_layers", [])
+        C_removed = stages.get("C", {}).get("removed_layers", [])
+        dropped = sorted(set(B_removed + C_removed))
+
+    # simdrop.removed_layers (구버전)
+    if not dropped:
+        dropped = manifest.get("simdrop", {}).get("removed_layers", [])
+
+    return sorted(set(int(i) for i in dropped))
+
+
+def _install_passlayers(model, dropped_indices: List[int], return_tuple: bool = True):
+    """
+    ★ 핵심: from_pretrained() 후 dropped 레이어 위치에 PassLayer를 설치합니다.
+
+    from_pretrained()는 config.num_hidden_layers=32 기준으로 32개 MistralDecoderLayer를
+    생성하고, safetensors에 가중치가 없는 레이어는 랜덤 초기화됩니다.
+    이 랜덤 레이어가 hidden_states를 오염시키므로 반드시 PassLayer로 교체해야 합니다.
+    """
+    if not dropped_indices:
+        return model
+
+    layers = _get_mistral_layers(model)
+    hidden_size = model.config.hidden_size
+
+    for idx in dropped_indices:
+        if 0 <= idx < len(layers):
+            old = layers[idx]
+            # PassLayer를 같은 디바이스에 배치
+            dev = next(old.parameters()).device if sum(1 for _ in old.parameters()) > 0 else torch.device("cpu")
+            layers[idx] = MistralPassLayer(return_tuple=return_tuple).to(dev)
+            del old
+
+    print(f"  ✓ PassLayer 설치: {dropped_indices} ({len(dropped_indices)}개 레이어)")
+    return model
+
+
+# ============================================================
+# 모델 & 토크나이저 로드
+# ============================================================
+def _load_model(model_path: str, dtype: torch.dtype, device: str):
+    print(f"  Loading model from: {model_path}")
+    resolved = os.path.abspath(model_path) if os.path.exists(model_path) else model_path
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            resolved, torch_dtype=dtype, low_cpu_mem_usage=True,
+            attn_implementation="eager", trust_remote_code=True,
+        )
+    except TypeError:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                resolved, torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True,
+            )
+        except TypeError:
+            model = AutoModelForCausalLM.from_pretrained(
+                resolved, dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True,
+            )
+    # ★ manifest.json이 있으면 dropped 레이어에 PassLayer 설치
+    #   from_pretrained()가 랜덤 초기화한 레이어를 identity로 교체
+    dropped = _read_dropped_layers(model_path)
+    if dropped:
+        return_tuple = _detect_layer_return_tuple(model)
+        model = _install_passlayers(model, dropped, return_tuple=return_tuple)
+
+    model = model.to(device)
+    model.eval()
+
+    n_layers = model.config.num_hidden_layers
+    n_params = sum(p.numel() for p in model.parameters())
+    n_active = n_layers - len(dropped)
+    if dropped:
+        print(f"  ✓ {model.config.model_type} | {n_layers} layers ({n_active} active + {len(dropped)} PassLayer) | {n_params/1e6:.1f}M params | {device}")
+    else:
+        print(f"  ✓ {model.config.model_type} | {n_layers} layers | {n_params/1e6:.1f}M params | {device}")
+    return model
+
+
+def _load_tokenizer(model_path: str, fallback_paths: Optional[List[str]] = None) -> AutoTokenizer:
+    candidates = [model_path]
+    if fallback_paths:
+        candidates.extend(fallback_paths)
+
+    errors = []
+    for path in candidates:
+        if path is None:
+            continue
+        try:
+            resolved = os.path.abspath(path) if os.path.exists(path) else path
+            tok = AutoTokenizer.from_pretrained(resolved, trust_remote_code=True)
+            if path != model_path:
+                print(f"  [INFO] Tokenizer fallback 사용: {path}")
+            return tok
+        except Exception as e:
+            errors.append((path, str(e)))
+
+    # slow tokenizer 시도
+    for path in candidates:
+        if path is None:
+            continue
+        try:
+            resolved = os.path.abspath(path) if os.path.exists(path) else path
+            tok = AutoTokenizer.from_pretrained(resolved, use_fast=False, trust_remote_code=True)
+            print(f"  [INFO] Slow tokenizer: {path}")
+            return tok
+        except Exception:
+            continue
+
+    em = "\n".join(f"  - {p}: {e}" for p, e in errors)
+    raise RuntimeError(f"Tokenizer 로드 실패:\n{em}\n--tokenizer_path 로 명시해 주세요.")
+
+
+def _find_tokenizer_fallbacks(model_path: str) -> List[str]:
+    fallbacks = []
+    orig_cfg = os.path.join(model_path, "original_config")
+    if os.path.isdir(orig_cfg):
+        fallbacks.append(orig_cfg)
+
+    manifest_path = os.path.join(model_path, "manifest.json")
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            base_model = manifest.get("base_model")
+            if base_model:
+                fallbacks.append(base_model)
+        except Exception:
+            pass
+    return fallbacks
+
+
+# ============================================================
+# DynamicStageManager: bundles에서 B/C 레이어 복원
+# ============================================================
+def _get_mistral_layers(model) -> nn.ModuleList:
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
+    raise RuntimeError("Cannot find model.model.layers")
+
+
 def _detect_layer_return_tuple(model) -> bool:
-    """
-    transformers 버전에 따라 decoder_layer의 반환 형태가 달라질 수 있어,
-    PassLayer도 동일한 형태로 맞춰주기 위한 휴리스틱.
-    """
     try:
         core = model.model if hasattr(model, "model") else model
         src = inspect.getsource(core.forward)
@@ -188,25 +307,24 @@ def _detect_layer_return_tuple(model) -> bool:
 _LAYER_RE = re.compile(r"layer_(\d+)\.safetensors$")
 
 
-def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
+def _build_layer_map(dir_path: Optional[Path]) -> Dict[int, Path]:
     m: Dict[int, Path] = {}
-    if not dir_path.exists():
+    if dir_path is None or not dir_path.exists():
         return m
     for p in dir_path.glob("layer_*.safetensors"):
         mm = _LAYER_RE.search(p.name)
         if mm:
-            idx = int(mm.group(1))
-            m[idx] = p
+            m[int(mm.group(1))] = p
     return m
+
+
+def _has_bundle_layers(dir_path: Optional[Path]) -> bool:
+    return len(_build_layer_map(dir_path)) > 0
 
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
     out = {}
-    needles = [
-        f"model.layers.{layer_idx}.",
-        f"model.model.layers.{layer_idx}.",
-        f"layers.{layer_idx}.",
-    ]
+    needles = [f"model.layers.{layer_idx}.", f"model.model.layers.{layer_idx}.", f"layers.{layer_idx}."]
     for k, v in sd.items():
         nk = k
         for nd in needles:
@@ -217,112 +335,86 @@ def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str
     return out
 
 
-def _maybe_shift_indices_to_zero_based(
-    B_map: Dict[int, Path],
-    C_map: Dict[int, Path],
-    num_layers: int,
-) -> Tuple[Dict[int, Path], Dict[int, Path], int]:
+def _maybe_shift_indices(B_map, C_map, num_layers):
     all_idx = sorted(set(B_map.keys()) | set(C_map.keys()))
     if not all_idx:
         return B_map, C_map, 0
-
-    out_of_range = any((i < 0 or i >= num_layers) for i in all_idx)
-    if not out_of_range:
+    if all(0 <= i < num_layers for i in all_idx):
         return B_map, C_map, 0
-
-    one_based_ok = all((1 <= i <= num_layers) for i in all_idx)
-    if one_based_ok:
-        B2 = {i - 1: p for i, p in B_map.items()}
-        C2 = {i - 1: p for i, p in C_map.items()}
-        return B2, C2, -1
-
-    raise ValueError(
-        f"bundles layer index mismatch (num_layers={num_layers}, max={max(all_idx)}). "
-        "base_model과 bundles가 같은 기반 모델인지 확인해 주세요."
-    )
+    if all(1 <= i <= num_layers for i in all_idx):
+        return {i-1: p for i, p in B_map.items()}, {i-1: p for i, p in C_map.items()}, -1
+    raise ValueError(f"Bundle layer index mismatch (num_layers={num_layers})")
 
 
 class DynamicStageManager:
-    """
-    A:    removed 모두 PassLayer
-    AB:   C만 PassLayer (B 복구)
-    FULL: B,C 모두 복구 (ABC)
-    """
+    """A: removed→PassLayer / AB: C만PassLayer / FULL: 전부 복구"""
 
     def __init__(
         self,
         model,
-        bundles_dir: Path,
         device: str,
         dtype: torch.dtype,
         passlayer_return_tuple: bool,
-        B_dir: Optional[Path] = None,   # ✅ 추가
-        C_dir: Optional[Path] = None,   # ✅ 추가
+        bundles_dir: Optional[Path] = None,
+        B_dir: Optional[Path] = None,
+        C_dir: Optional[Path] = None,
     ):
         if MistralDecoderLayer is None:
-            raise RuntimeError("MistralDecoderLayer import 실패 (mistral 모델/transformers 버전 확인).")
+            raise RuntimeError("MistralDecoderLayer import 실패")
+        if load_file is None:
+            raise RuntimeError("safetensors import 실패 (pip install safetensors)")
 
         self.model = model
         self.layers = _get_mistral_layers(model)
         self.device = device
         self.dtype = dtype
         self.passlayer_return_tuple = passlayer_return_tuple
-
         self.num_layers = len(self.layers)
-        self.B_dir = B_dir if B_dir is not None else (bundles_dir / "B")
-        self.C_dir = C_dir if C_dir is not None else (bundles_dir / "C")
 
-        B_raw = _build_layer_map(self.B_dir)
-        C_raw = _build_layer_map(self.C_dir)
-        self.B_map, self.C_map, self.index_shift = _maybe_shift_indices_to_zero_based(B_raw, C_raw, self.num_layers)
+        if B_dir is None and bundles_dir is not None:
+            B_dir = bundles_dir / "B"
+        if C_dir is None and bundles_dir is not None:
+            C_dir = bundles_dir / "C"
 
+        self.B_dir = B_dir
+        self.C_dir = C_dir
+
+        B_raw = _build_layer_map(B_dir) if B_dir is not None else {}
+        C_raw = _build_layer_map(C_dir) if C_dir is not None else {}
+        if not B_raw and not C_raw:
+            raise FileNotFoundError(
+                "No bundle layer files found. "
+                f"B_dir={B_dir}, C_dir={C_dir}, bundles_dir={bundles_dir}"
+            )
+
+        self.B_map, self.C_map, _ = _maybe_shift_indices(B_raw, C_raw, self.num_layers)
         self.B_idx = sorted(self.B_map.keys())
         self.C_idx = sorted(self.C_map.keys())
         self.removed = sorted(set(self.B_idx) | set(self.C_idx))
 
-        self.set_stage("A")
+    def stage_meta(self):
+        return {"num_layers": self.num_layers, "B": self.B_idx, "C": self.C_idx, "removed": self.removed}
 
-    def stage_meta(self) -> Dict[str, Any]:
-        return {
-            "num_layers": self.num_layers,
-            "index_shift_applied": self.index_shift,
-            "B": self.B_idx,
-            "C": self.C_idx,
-            "removed": self.removed,
-        }
+    def _bundle_path(self, layer_i):
+        return self.B_map.get(layer_i) or self.C_map.get(layer_i)
 
-    def _bundle_path(self, layer_i: int) -> Optional[Path]:
-        if layer_i in self.B_map:
-            return self.B_map[layer_i]
-        if layer_i in self.C_map:
-            return self.C_map[layer_i]
-        return None
-
-    def _restore_one_layer(self, layer_i: int):
+    def _restore_one_layer(self, layer_i):
         p = self._bundle_path(layer_i)
         if p is None:
             raise FileNotFoundError(f"layer_{layer_i}.safetensors not found in B/C.")
-
         try:
             new_layer = MistralDecoderLayer(self.model.config, layer_i)
         except TypeError:
             new_layer = MistralDecoderLayer(self.model.config)
-
         new_layer = new_layer.to(self.device, dtype=self.dtype)
-
         sd = load_file(str(p), device="cpu")
         sd = _strip_layer_prefix(sd, layer_i)
-
-        missing, unexpected = new_layer.load_state_dict(sd, strict=False)
-        if (len(missing) > 0 or len(unexpected) > 0):
-            # 너무 시끄럽게 출력하긴 싫어서 warn 정도만
-            print(f"[WARN] layer {layer_i}: missing={len(missing)} unexpected={len(unexpected)}")
-
+        new_layer.load_state_dict(sd, strict=False)
         old = self.layers[layer_i]
         self.layers[layer_i] = new_layer
         del old
 
-    def _pass_one_layer(self, layer_i: int):
+    def _pass_one_layer(self, layer_i):
         old = self.layers[layer_i]
         self.layers[layer_i] = MistralPassLayer(return_tuple=self.passlayer_return_tuple).to(self.device)
         del old
@@ -331,17 +423,10 @@ class DynamicStageManager:
         stage = stage.upper()
         if stage not in ("A", "AB", "FULL"):
             raise ValueError("stage must be A / AB / FULL")
-
-        if stage == "A":
-            pass_set = set(self.removed)
-        elif stage == "AB":
-            pass_set = set(self.C_idx)
-        else:
-            pass_set = set()
+        pass_set = set(self.removed) if stage == "A" else (set(self.C_idx) if stage == "AB" else set())
 
         for i in self.removed:
-            cur = self.layers[i]
-            is_pass = isinstance(cur, MistralPassLayer)
+            is_pass = isinstance(self.layers[i], MistralPassLayer)
             if i in pass_set:
                 if not is_pass:
                     self._pass_one_layer(i)
@@ -353,269 +438,250 @@ class DynamicStageManager:
             torch.cuda.empty_cache()
 
 
-# -----------------------------
-# Loader normalization (dict/tuple/tensor/str 모두 처리)
-# -----------------------------
+# ============================================================
+# ★ 데이터 로더 — Tokens=0 버그의 핵심 수정 영역
+# ============================================================
 def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
     return x.unsqueeze(0) if x.dim() == 1 else x
 
 
-def _is_attn_mask_like(t: torch.Tensor) -> bool:
-    if t.dtype not in (torch.int64, torch.int32, torch.int16, torch.uint8, torch.bool):
-        return False
-    u = torch.unique(t.detach().cpu())
-    return all(int(v) in (0, 1) for v in u.tolist()[:10])
+def _call_get_loaders(dataset: str, tok, nsamples: int, seed: int, seqlen: int):
+    """
+    ★ get_loaders 시그니처 문제 해결.
+
+    data.py의 실제 시그니처:
+        get_loaders(name, nsamples=128, seed=0, seqlen=2048, tokenizer=None)
+
+    이전 코드 문제:
+        GET_LOADERS(dataset, tok, seqlen=..., nsamples=..., seed=...)
+        → 두 번째 positional로 tok이 들어가 nsamples=tok이 됨 → TypeError
+
+    수정: keyword-only로 호출하여 시그니처 충돌 방지
+    """
+    if GET_LOADERS is None:
+        raise RuntimeError(
+            "get_loaders import 실패. --text_file로 평가하거나 "
+            "pruning/data.py 경로를 확인해 주세요."
+        )
+
+    # ★ 안전한 호출: 모두 keyword argument로
+    return GET_LOADERS(
+        dataset,
+        nsamples=nsamples,
+        seed=seed,
+        seqlen=seqlen,
+        tokenizer=tok,
+    )
 
 
-def _extract_batch(
-    batch: Any,
-    tok: AutoTokenizer,
-    device: str,
-    seqlen: int,
-) -> Optional[Dict[str, torch.Tensor]]:
+def _pick_split(obj: Any, split: str) -> Any:
     """
-    Returns dict:
-      - input_ids [B,T]
-      - attention_mask [B,T]
-      - labels [B,T] (optional; -100 supported)
+    get_loaders 반환값에서 적절한 split을 선택.
+
+    wikitext2/ptb: (trainloader, testenc)
+    c4: (trainloader, valenc)
     """
-    # 1) dict
+    if isinstance(obj, dict):
+        for k in (split, "test", "validation", "val", "train"):
+            if k in obj:
+                return obj[k]
+        return next(iter(obj.values()))
+
+    if isinstance(obj, tuple) and len(obj) >= 2:
+        # obj = (trainloader, testenc)
+        # split이 test/val이면 obj[1], 아니면 obj[0]
+        if split in ("test", "validation", "val"):
+            return obj[1]
+        return obj[0]
+
+    return obj
+
+
+def _tensor_to_batches(
+    ids: torch.Tensor, seqlen: int, batch_size: int,
+    device: str, max_batches: Optional[int],
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    1D 또는 2D 텐서를 seqlen 블록으로 잘라 배치 리스트로 변환합니다.
+    """
+    if ids.dim() == 2:
+        ids = ids[0]  # [1, N] → [N]
+    ids = ids.long()
+
+    batches = []
+    cur: List[torch.Tensor] = []
+    total = ids.numel()
+
+    for start in range(0, total - seqlen + 1, seqlen):
+        cur.append(ids[start: start + seqlen])
+        if len(cur) == batch_size:
+            x = torch.stack(cur, dim=0).to(device)
+            batches.append({"input_ids": x, "attention_mask": torch.ones_like(x, dtype=torch.long)})
+            cur = []
+            if max_batches is not None and len(batches) >= max_batches:
+                return batches
+
+    return batches
+
+
+def _extract_batch(batch: Any, device: str, seqlen: int) -> Optional[Dict[str, torch.Tensor]]:
+    """(input_ids, target) 튜플 등 개별 배치를 정규화."""
     if isinstance(batch, dict):
-        if "input_ids" in batch:
-            input_ids = batch["input_ids"]
-            attn = batch.get("attention_mask", None)
-            labels = batch.get("labels", None)
-
-            if not torch.is_tensor(input_ids):
-                return None
-            input_ids = _ensure_2d(input_ids)
-
-            # optional: 너무 길면 잘라서 안정화
-            if input_ids.size(1) > seqlen:
-                input_ids = input_ids[:, :seqlen]
-
-            input_ids = input_ids.to(device)
-
-            if attn is None:
-                attn = torch.ones_like(input_ids, dtype=torch.long)
-            else:
-                attn = _ensure_2d(attn)
-                if attn.size(1) > input_ids.size(1):
-                    attn = attn[:, : input_ids.size(1)]
-                elif attn.size(1) < input_ids.size(1):
-                    # 부족하면 1로 패딩
-                    pad = torch.ones((attn.size(0), input_ids.size(1) - attn.size(1)), dtype=attn.dtype)
-                    attn = torch.cat([attn, pad], dim=1)
-                attn = attn.to(device)
-
-            out = {"input_ids": input_ids, "attention_mask": attn}
-            if labels is not None and torch.is_tensor(labels):
-                labels = _ensure_2d(labels)
-                if labels.size(1) > input_ids.size(1):
-                    labels = labels[:, : input_ids.size(1)]
-                elif labels.size(1) < input_ids.size(1):
-                    pad = torch.full((labels.size(0), input_ids.size(1) - labels.size(1)), -100, dtype=labels.dtype)
-                    labels = torch.cat([labels, pad], dim=1)
-                out["labels"] = labels.to(device)
-            return out
-
-        return None
-
-    # 2) tuple/list
-    if isinstance(batch, (tuple, list)):
-        if len(batch) == 0:
+        ids = batch.get("input_ids")
+        if ids is None or not torch.is_tensor(ids):
             return None
-        if len(batch) == 1 and torch.is_tensor(batch[0]):
-            input_ids = _ensure_2d(batch[0])
-            if input_ids.size(1) > seqlen:
-                input_ids = input_ids[:, :seqlen]
-            input_ids = input_ids.to(device)
-            attn = torch.ones_like(input_ids, dtype=torch.long)
-            return {"input_ids": input_ids, "attention_mask": attn}
+        ids = _ensure_2d(ids)[:, :seqlen].to(device)
+        attn = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.long))
+        attn = _ensure_2d(attn)[:, :seqlen].to(device)
+        out = {"input_ids": ids, "attention_mask": attn}
+        labels = batch.get("labels")
+        if labels is not None and torch.is_tensor(labels):
+            out["labels"] = _ensure_2d(labels)[:, :seqlen].to(device)
+        return out
 
-        if len(batch) >= 2 and torch.is_tensor(batch[0]) and torch.is_tensor(batch[1]):
-            x = _ensure_2d(batch[0])
-            y = _ensure_2d(batch[1])
+    if isinstance(batch, (tuple, list)) and len(batch) >= 1 and torch.is_tensor(batch[0]):
+        ids = _ensure_2d(batch[0])[:, :seqlen].to(device)
+        attn = torch.ones_like(ids, dtype=torch.long)
+        return {"input_ids": ids, "attention_mask": attn}
 
-            if x.size(1) > seqlen:
-                x = x[:, :seqlen]
-                if y.size(1) >= seqlen:
-                    y = y[:, :seqlen]
-
-            x = x.to(device)
-            y = y.to(device)
-
-            if y.shape == x.shape and _is_attn_mask_like(y):
-                return {"input_ids": x, "attention_mask": y}
-
-            attn = torch.ones_like(x, dtype=torch.long)
-            return {"input_ids": x, "attention_mask": attn, "labels": y}
-
-        return None
-
-    # 3) tensor
     if torch.is_tensor(batch):
-        input_ids = _ensure_2d(batch)
-        if input_ids.size(1) > seqlen:
-            input_ids = input_ids[:, :seqlen]
-        input_ids = input_ids.to(device)
-        attn = torch.ones_like(input_ids, dtype=torch.long)
-        return {"input_ids": input_ids, "attention_mask": attn}
+        ids = _ensure_2d(batch)[:, :seqlen].to(device)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids, dtype=torch.long)}
 
     return None
 
 
 def _pack_text_lines_to_batches(
-    lines: Iterator[str],
-    tok: AutoTokenizer,
-    seqlen: int,
-    batch_size: int,
-    device: str,
-    max_batches: Optional[int],
-) -> Iterator[Dict[str, torch.Tensor]]:
-    """
-    loader가 str(라인)들을 뱉는 경우: tokenize해서 연속 토큰 스트림으로 붙인 뒤 seqlen 블록으로 잘라 배치 생성
-    """
+    lines: Iterator[str], tok: AutoTokenizer, seqlen: int,
+    batch_size: int, device: str, max_batches: Optional[int],
+) -> List[Dict[str, torch.Tensor]]:
     buf: List[int] = []
-    made = 0
-    cur_batch: List[torch.Tensor] = []
+    batches = []
+    cur: List[torch.Tensor] = []
 
     for s in lines:
-        if not isinstance(s, str):
-            continue
-        if not s.strip():
+        if not isinstance(s, str) or not s.strip():
             continue
         ids = tok(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-        if not ids:
-            continue
         buf.extend(ids)
-
         while len(buf) >= seqlen:
-            chunk = torch.tensor(buf[:seqlen], dtype=torch.long)
+            cur.append(torch.tensor(buf[:seqlen], dtype=torch.long))
             buf = buf[seqlen:]
-
-            cur_batch.append(chunk)
-            if len(cur_batch) == batch_size:
-                input_ids = torch.stack(cur_batch, dim=0).to(device)
-                attn = torch.ones_like(input_ids, dtype=torch.long)
-                yield {"input_ids": input_ids, "attention_mask": attn}
-                cur_batch = []
-                made += 1
-                if max_batches is not None and made >= max_batches:
-                    return
+            if len(cur) == batch_size:
+                x = torch.stack(cur, dim=0).to(device)
+                batches.append({"input_ids": x, "attention_mask": torch.ones_like(x, dtype=torch.long)})
+                cur = []
+                if max_batches is not None and len(batches) >= max_batches:
+                    return batches
+    return batches
 
 
-def _iter_textfile_batches(
-    tok: AutoTokenizer,
-    text_file: Path,
-    seqlen: int,
-    batch_size: int,
-    device: str,
-    max_batches: Optional[int],
-) -> Iterator[Dict[str, torch.Tensor]]:
-    def _lines():
-        with text_file.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                yield line.rstrip("\n")
-
-    return _pack_text_lines_to_batches(_lines(), tok, seqlen, batch_size, device, max_batches)
-
-
-def _normalize_loader_to_batches(
+def prepare_batches(
     raw_loader: Any,
     tok: AutoTokenizer,
     seqlen: int,
     batch_size: int,
     device: str,
     max_batches: Optional[int],
-) -> Iterator[Dict[str, torch.Tensor]]:
+) -> List[Dict[str, torch.Tensor]]:
     """
-    raw_loader가:
-      - iterable of dict/tuple/tensor  -> extract_batch로 바로 처리
-      - iterable of str               -> pack_text_lines_to_batches로 처리
-      - str or list[str]             -> pack 처리
-      - torch.Tensor (whole corpus)  -> chunk 처리
+    ★★★ Tokens=0 버그 수정의 핵심 함수 ★★★
+
+    get_loaders가 반환하는 raw_loader의 실제 타입:
+      - wikitext2 test → BatchEncoding  (dict 상속, iter하면 "input_ids" 등 키 문자열!)
+      - c4 val        → TokenizerWrapper (.input_ids = tensor)
+      - trainloader   → list of (input_ids_tensor, target_tensor) tuples
+
+    이전 코드 버그:
+      BatchEncoding을 iter()하면 "input_ids" 문자열이 나오는데,
+      이걸 _extract_batch()에 넣으면 None → tokens=0
+
+    수정: raw_loader 타입을 먼저 판별하여 적절히 텐서를 추출
     """
+
+    # ─── Case 1: .input_ids 속성을 가진 객체 (TokenizerWrapper, BatchEncoding) ───
+    # BatchEncoding은 dict를 상속하므로 isinstance(raw_loader, dict)로도 잡힘
+    # 하지만 .input_ids 체크가 더 안전
+    input_ids_tensor = None
+
+    # 1a) dict-like (BatchEncoding 포함) → ["input_ids"] 키로 접근
+    if isinstance(raw_loader, dict) and "input_ids" in raw_loader:
+        val = raw_loader["input_ids"]
+        if torch.is_tensor(val):
+            input_ids_tensor = val
+            print(f"  [DEBUG] raw_loader is dict/BatchEncoding, input_ids shape: {val.shape}")
+
+    # 1b) .input_ids 속성 (TokenizerWrapper)
+    if input_ids_tensor is None and hasattr(raw_loader, "input_ids"):
+        val = getattr(raw_loader, "input_ids", None)
+        if torch.is_tensor(val):
+            input_ids_tensor = val
+            print(f"  [DEBUG] raw_loader has .input_ids attr, shape: {val.shape}")
+
+    if input_ids_tensor is not None:
+        return _tensor_to_batches(input_ids_tensor, seqlen, batch_size, device, max_batches)
+
+    # ─── Case 2: 텐서 (whole corpus) ───
+    if torch.is_tensor(raw_loader):
+        print(f"  [DEBUG] raw_loader is tensor, shape: {raw_loader.shape}")
+        return _tensor_to_batches(raw_loader, seqlen, batch_size, device, max_batches)
+
+    # ─── Case 3: 문자열 ───
     if isinstance(raw_loader, str):
         return _pack_text_lines_to_batches(iter([raw_loader]), tok, seqlen, batch_size, device, max_batches)
 
-    if isinstance(raw_loader, list) and raw_loader and isinstance(raw_loader[0], str):
-        return _pack_text_lines_to_batches(iter(raw_loader), tok, seqlen, batch_size, device, max_batches)
+    # ─── Case 4: 리스트 ───
+    if isinstance(raw_loader, list):
+        if not raw_loader:
+            return []
 
-    if torch.is_tensor(raw_loader):
-        ids = raw_loader
-        if ids.dim() == 2:
-            ids = ids[0]
+        # 문자열 리스트
+        if isinstance(raw_loader[0], str):
+            return _pack_text_lines_to_batches(iter(raw_loader), tok, seqlen, batch_size, device, max_batches)
 
-        def _gen():
-            made = 0
-            cur: List[torch.Tensor] = []
-            total = ids.numel()
-            for start in range(0, total - seqlen + 1, seqlen):
-                cur.append(ids[start : start + seqlen].clone().long())
-                if len(cur) == batch_size:
-                    x = torch.stack(cur, dim=0).to(device)
-                    attn = torch.ones_like(x, dtype=torch.long)
-                    yield {"input_ids": x, "attention_mask": attn}
-                    cur = []
-                    made += 1
-                    if max_batches is not None and made >= max_batches:
-                        return
+        # (input_ids, target) 튜플 리스트 — trainloader 형태
+        batches = []
+        for item in raw_loader:
+            b = _extract_batch(item, device, seqlen)
+            if b is not None:
+                batches.append(b)
+                if max_batches is not None and len(batches) >= max_batches:
+                    break
+        if batches:
+            print(f"  [DEBUG] raw_loader is list of {len(raw_loader)} items → {len(batches)} batches")
+        return batches
 
-        return _gen()
-
-    it = iter(raw_loader)
-
+    # ─── Case 5: 이터러블 (DataLoader 등) ───
+    batches = []
     try:
-        first = next(it)
-    except StopIteration:
-        return iter([])
+        for item in raw_loader:
+            b = _extract_batch(item, device, seqlen)
+            if b is not None:
+                batches.append(b)
+                if max_batches is not None and len(batches) >= max_batches:
+                    break
+    except Exception as e:
+        print(f"  [WARN] iteration failed: {e}")
 
-    if isinstance(first, str):
+    if batches:
+        print(f"  [DEBUG] iterable → {len(batches)} batches")
+    else:
+        print(f"  [ERROR] raw_loader type={type(raw_loader).__name__}, 배치를 추출하지 못했습니다!")
+        print(f"  [ERROR] raw_loader repr: {repr(raw_loader)[:200]}")
 
-        def _lines():
-            yield first
-            for x in it:
-                if isinstance(x, str):
-                    yield x
-
-        return _pack_text_lines_to_batches(_lines(), tok, seqlen, batch_size, device, max_batches)
-
-    def _batches():
-        made = 0
-        b0 = _extract_batch(first, tok, device, seqlen)
-        if b0 is not None:
-            yield b0
-            made += 1
-            if max_batches is not None and made >= max_batches:
-                return
-
-        for b in it:
-            bb = _extract_batch(b, tok, device, seqlen)
-            if bb is None:
-                continue
-            yield bb
-            made += 1
-            if max_batches is not None and made >= max_batches:
-                return
-
-    return _batches()
+    return batches
 
 
-# -----------------------------
-# PPL eval
-# -----------------------------
+# ============================================================
+# PPL 평가
+# ============================================================
 @torch.no_grad()
-def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, float]:
-    """
-    Token-weighted NLL / PPL.
-    If labels exist (-100 allowed), use them directly.
-    Else do next-token shift on input_ids.
-    """
+def eval_ppl(model, batches: List[Dict[str, torch.Tensor]]) -> Dict[str, float]:
+    """Token-weighted NLL / PPL."""
     sum_nll = 0.0
     sum_tok = 0
 
-    for batch in loader:
+    for batch in batches:
         input_ids = batch["input_ids"]
         attn = batch.get("attention_mask", torch.ones_like(input_ids, dtype=torch.long))
         labels = batch.get("labels", None)
@@ -625,49 +691,35 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
         if attn.dim() != 2:
             attn = _ensure_2d(attn)
 
-        # case 1) labels provided: cross_entropy(ignore_index=-100)
+        # case 1) labels provided
         if labels is not None:
             if labels.dim() != 2:
                 labels = _ensure_2d(labels)
-
-            # ✅ attention_mask=0인 곳은 loss에서 제외되도록 -100 처리
-            if attn is not None:
-                labels = labels.clone()
-                labels[attn == 0] = -100
-
+            labels = labels.clone()
+            labels[attn == 0] = -100
             out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-            logits = out.logits  # [B,T,V]
-            V = logits.size(-1)
-
+            V = out.logits.size(-1)
             loss_sum = F.cross_entropy(
-                logits.float().view(-1, V),
-                labels.view(-1),
-                ignore_index=-100,
-                reduction="sum",
+                out.logits.float().view(-1, V), labels.view(-1),
+                ignore_index=-100, reduction="sum",
             )
-            tok_cnt = (labels != -100).sum().item()
             sum_nll += float(loss_sum.item())
-            sum_tok += int(tok_cnt)
+            sum_tok += int((labels != -100).sum().item())
             continue
 
-        # case 2) no labels: next-token shift with attention_mask
+        # case 2) next-token shift
         if input_ids.shape[1] < 2:
             continue
-
         out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-        logits = out.logits  # [B,T,V]
-
+        logits = out.logits
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
         shift_mask = attn[:, 1:].contiguous().float()
-
         V = shift_logits.size(-1)
         loss_tok = F.cross_entropy(
-            shift_logits.float().view(-1, V),
-            shift_labels.view(-1),
+            shift_logits.float().view(-1, V), shift_labels.view(-1),
             reduction="none",
         ).view_as(shift_labels).float()
-
         sum_nll += float((loss_tok * shift_mask).sum().item())
         sum_tok += int(shift_mask.sum().item())
 
@@ -675,211 +727,245 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
         return {"mean_nll": float("nan"), "ppl": float("nan"), "tokens": 0}
 
     mean_nll = sum_nll / sum_tok
-    ppl = math.exp(mean_nll)
+    ppl = math.exp(min(mean_nll, 100.0))
     return {"mean_nll": mean_nll, "ppl": ppl, "tokens": sum_tok}
 
 
-def _load_model(base_model: str, dtype: torch.dtype, device: str):
-    # transformers 버전별 호환
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            attn_implementation="eager",
-        )
-    except TypeError:
-        try:
-            model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype, low_cpu_mem_usage=True)
-        except TypeError:
-            model = AutoModelForCausalLM.from_pretrained(base_model, dtype=dtype, low_cpu_mem_usage=True)
-    return model.to(device)
-
-
-def _load_tokenizer(base_model: str):
-    """
-    fast tokenizer 우선, 실패 시 slow tokenizer로 폴백.
-    """
-    try:
-        return AutoTokenizer.from_pretrained(base_model, use_fast=True)
-    except Exception as e_fast:
-        try:
-            tok = AutoTokenizer.from_pretrained(base_model, use_fast=False)
-            print(f"[INFO] fast tokenizer load failed -> fallback to slow tokenizer: {e_fast}")
-            return tok
-        except Exception as e_slow:
-            em = f"{e_fast}\n{e_slow}".lower()
-            hint = ""
-            if ("sentencepiece" in em) or ("tiktoken" in em):
-                hint = " Install dependencies: pip install sentencepiece tiktoken"
-            raise RuntimeError(
-                f"Tokenizer load failed for '{base_model}'. fast/slow tokenizer 모두 로드 실패.{hint}"
-            ) from e_slow
-
-
-def _pick_split(obj: Any, split: str) -> Any:
-    """
-    get_loaders 반환이 (train, test) / dict / single 인 경우 대응.
-    split 선택 결과가 str로 떨어지면(가끔 키가 텍스트로 들어감) 다른 후보로 스왑 시도.
-    """
-    if isinstance(obj, dict):
-        if split in obj:
-            return obj[split]
-        for k in (split, "test", "validation", "val", "train"):
-            if k in obj:
-                return obj[k]
-        return next(iter(obj.values()))
-
-    if isinstance(obj, tuple) and len(obj) >= 2:
-        cand = obj[1] if split in ("test", "validation", "val") else obj[0]
-        other = obj[0] if cand is obj[1] else obj[1]
-        if isinstance(cand, str) and not isinstance(other, str):
-            return other
-        return cand
-
-    return obj
-
-
+# ============================================================
+# LoRA 어댑터 (미머지 비교용)
+# ============================================================
 def _apply_lora_no_merge(model, adapter_path: str):
-    if adapter_path is None:
-        return None
     if PeftModel is None:
-        raise RuntimeError("peft import 실패. (pip install peft) 후 다시 실행해 주세요.")
+        raise RuntimeError("peft import 실패. pip install peft")
     model_lora = PeftModel.from_pretrained(model, adapter_path, is_trainable=False)
     model_lora.eval()
     return model_lora
 
 
-def _parse_lora_list(spec: Optional[str]) -> List[str]:
-    if not spec:
-        return []
-    return [p.strip() for p in spec.split(",") if p.strip()]
-
-
+# ============================================================
+# 메인
+# ============================================================
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--base_model", required=True)
-    ap.add_argument("--bundles_dir", required=True)
+    ap = argparse.ArgumentParser(
+        description="머지된 모델의 PPL을 평가합니다.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # A-only 평가
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path ./merged_models/A_merged
+
+  # A/AB/FULL stage 비교 (bundles 필요)
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path ./merged_models/A_merged \\
+    --bundles_dir ./25_mistral_results/pruning/bundles \\
+    --stages A,AB,FULL
+
+  # A+AB 평가 (A_merged + B_merged, C=PassLayer)
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path ./merged_models/A_merged \\
+    --bundle_B_dir ./merged_models_mistral_7b/B_merged \\
+    --stages A,AB
+
+  # FULL 평가 (A_merged + B_merged + C_merged)
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path ./merged_models/A_merged \\
+    --bundle_B_dir ./merged_models_mistral_7b/B_merged \\
+    --bundle_C_dir ./merged_models_mistral_7b/C_merged \\
+    --stages FULL
+
+  # 여러 모델 비교
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path mistralai/Mistral-7B-v0.1 ./merged/A_merged ./merged/AB_merged
+
+  # LoRA 미머지 비교
+  python -m mistral_prune_lora.mistral_eval_ppl_mergedmodel \\
+    --model_path ./pruning/A --lora_paths ./adapters/A_lora/stageA
+        """,
+    )
+    ap.add_argument("--model_path", type=str, nargs="+", required=True,
+                    help="머지된 모델 경로 (여러 개 → 순차 비교)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
 
+    # 데이터셋
     ap.add_argument("--dataset", default="wikitext2")
     ap.add_argument("--split", default="test")
-    ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_batches", type=int, default=None)
+    ap.add_argument("--text_file", default=None)
 
-    ap.add_argument("--text_file", default=None, help="이거 주면 get_loaders 없이 txt로 평가(가장 안정적)")
+    # Stage 평가 (bundle source 필요)
+    ap.add_argument("--bundles_dir", default=None,
+                    help="기존 B/C 번들 루트 디렉터리 (예: ./pruning/bundles)")
+    ap.add_argument("--bundle_B_dir", default=None,
+                    help="B 번들(또는 B_merged) 디렉터리 override")
+    ap.add_argument("--bundle_C_dir", default=None,
+                    help="C 번들(또는 C_merged) 디렉터리 override")
+    ap.add_argument("--stages", default="A",
+                    help="평가할 stage (comma-separated: A,AB,FULL). AB는 B bundle, FULL은 B+C bundle 필요")
 
-    # LoRA (no-merge) 옵션
-    ap.add_argument("--lora_A", default=None, help="A stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--lora_AB", default=None, help="AB stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--lora_FULL", default=None, help="FULL stage adapter dir (comma-separated => each evaluated separately)")
-    ap.add_argument("--bundle_B_dir", default=None, help="B 번들 폴더 override (e.g., ./merged_models/bundles/B_merged)")
-    ap.add_argument("--bundle_C_dir", default=None, help="C 번들 폴더 override (optional)")
-    ap.add_argument("--stages", default="A,AB,FULL", help="comma-separated stages: A,AB,FULL")
+    # LoRA 비교
+    ap.add_argument("--lora_paths", type=str, nargs="*", default=None)
+    ap.add_argument("--tokenizer_path", default=None)
 
     args = ap.parse_args()
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    tok = _load_tokenizer(args.base_model)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-
-    def make_raw_loader():
-        if args.text_file is not None:
-            return _iter_textfile_batches(
-                tok=tok,
-                text_file=Path(args.text_file),
-                seqlen=args.seqlen,
-                batch_size=args.batch_size,
-                device=args.device,
-                max_batches=args.max_batches,
-            )
-
-        if GET_LOADERS is None:
-            raise RuntimeError("get_loaders import 실패. --text_file로 평가하거나 get_loaders 경로를 맞춰줘야 해요.")
-
-        # get_loaders 시그니처가 레포마다 달라서 여러 패턴 try
-        try:
-            raw = GET_LOADERS(args.dataset, tok, seqlen=args.seqlen, nsamples=args.nsamples, seed=args.seed, split=args.split)
-        except TypeError:
-            try:
-                raw = GET_LOADERS(args.dataset, tok, args.seqlen, args.nsamples, args.seed)
-            except TypeError:
-                raw = GET_LOADERS(args.dataset, nsamples=args.nsamples, seed=args.seed, seqlen=args.seqlen, tokenizer=tok)
-
-        return _pick_split(raw, args.split)
-
-    # stage별 평가
     stage_list = [s.strip().upper() for s in args.stages.split(",") if s.strip()]
-    label_map = {"A": "A", "AB": "AB", "FULL": "ABC"}
-
     for stage in stage_list:
         if stage not in ("A", "AB", "FULL"):
             raise ValueError(f"Invalid stage in --stages: {stage} (use A,AB,FULL)")
-        label = label_map[stage]
-    # ✅ stage마다 fresh load (LoRA in-place 변형/오염 방지)
-        model = _load_model(args.base_model, dtype=dtype, device=args.device)
-        model.eval()
 
-        passlayer_return_tuple = _detect_layer_return_tuple(model)
-        mgr = DynamicStageManager(
-            model=model,
-            bundles_dir=Path(args.bundles_dir),
-            device=args.device,
-            dtype=dtype,
-            passlayer_return_tuple=passlayer_return_tuple,
-            B_dir=Path(args.bundle_B_dir) if args.bundle_B_dir else None,  # ✅ 추가
-            C_dir=Path(args.bundle_C_dir) if args.bundle_C_dir else None,  # ✅ 추가
+    bundle_B_dir = Path(args.bundle_B_dir) if args.bundle_B_dir else (
+        Path(args.bundles_dir) / "B" if args.bundles_dir else None
+    )
+    bundle_C_dir = Path(args.bundle_C_dir) if args.bundle_C_dir else (
+        Path(args.bundles_dir) / "C" if args.bundles_dir else None
+    )
+
+    has_B_bundle = _has_bundle_layers(bundle_B_dir)
+    has_C_bundle = _has_bundle_layers(bundle_C_dir)
+
+    if "AB" in stage_list and not has_B_bundle:
+        print(
+            "⚠ WARNING: AB stage 평가에는 B bundle이 필요합니다. "
+            f"(checked: {bundle_B_dir}) -> AB를 제외합니다."
         )
+        stage_list = [s for s in stage_list if s != "AB"]
 
-
-        mgr.set_stage(stage)
-
-        # 그룹 메타는 첫 stage에서만 출력
-        if stage == "A":
-            print("\n=== GROUP META ===")
-            print(mgr.stage_meta())
-            print(f"device={args.device} dtype={args.dtype}\n")
-
-        # ✅ 동일 데이터로 base vs lora를 공정 비교하려고 배치를 한번 만들어 캐싱
-        raw_loader = make_raw_loader()
-        batches = list(
-            _normalize_loader_to_batches(
-                raw_loader=raw_loader,
-                tok=tok,
-                seqlen=args.seqlen,
-                batch_size=args.batch_size,
-                device=args.device,
-                max_batches=args.max_batches,
-            )
+    if "FULL" in stage_list and (not has_B_bundle or not has_C_bundle):
+        print(
+            "⚠ WARNING: FULL stage 평가에는 B + C bundle이 모두 필요합니다. "
+            f"(B: {bundle_B_dir}, C: {bundle_C_dir}) -> FULL을 제외합니다."
         )
+        stage_list = [s for s in stage_list if s != "FULL"]
 
-        # 1) base ppl
-        m_base = eval_ppl(model, iter(batches))
-        print(f"[{label}] BASE ppl={m_base['ppl']:.6f} | mean_nll={m_base['mean_nll']:.6f} | tokens={m_base['tokens']}")
+    if not stage_list:
+        print("⚠ WARNING: 평가 가능한 stage가 없어 A만 평가합니다.")
+        stage_list = ["A"]
 
-        # 2) lora ppl (no-merge)
-        lora_spec = {"A": args.lora_A, "AB": args.lora_AB, "FULL": args.lora_FULL}[stage]
-        lora_paths = _parse_lora_list(lora_spec)
+    results = []
 
-        # 콤마로 여러 개면 "각각 따로" 평가 (누적 적용 아님)
-        for p in lora_paths:
-            model_lora = _apply_lora_no_merge(model, p)
-            m_lora = eval_ppl(model_lora, iter(batches))
-            print(
-                f"[{label}] LoRA({Path(p).name}) ppl={m_lora['ppl']:.6f} | mean_nll={m_lora['mean_nll']:.6f} | tokens={m_lora['tokens']}"
+    print("=" * 70)
+    print("Merged Model PPL Evaluation")
+    print("=" * 70)
+    print(f"Models:      {args.model_path}")
+    print(f"Dataset:     {args.text_file or args.dataset} (split={args.split})")
+    print(f"Seq length:  {args.seqlen}")
+    print(f"Stages:      {stage_list}")
+    print(f"B bundle:    {bundle_B_dir} ({'found' if has_B_bundle else 'missing'})")
+    print(f"C bundle:    {bundle_C_dir} ({'found' if has_C_bundle else 'missing'})")
+    print(f"Device:      {args.device} ({args.dtype})")
+    print("=" * 70)
+
+    for model_idx, mpath in enumerate(args.model_path):
+        print(f"\n{'─' * 60}")
+        print(f"[{model_idx + 1}/{len(args.model_path)}] {mpath}")
+        print(f"{'─' * 60}")
+
+        # ── 토크나이저 로드 ──
+        tok_path = args.tokenizer_path or mpath
+        fallbacks = None if args.tokenizer_path else _find_tokenizer_fallbacks(mpath)
+        print(f"\n  Loading tokenizer from: {tok_path}")
+        tok = _load_tokenizer(tok_path, fallback_paths=fallbacks)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+
+        # ── 데이터 로더 + 배치 준비 ──
+        print(f"\n  Loading evaluation data...")
+        if args.text_file is not None:
+            batches = _pack_text_lines_to_batches(
+                iter(open(args.text_file, "r", encoding="utf-8", errors="ignore")),
+                tok, args.seqlen, args.batch_size, args.device, args.max_batches,
             )
-            del model_lora
+        else:
+            # ★ 수정된 호출: keyword-only로 시그니처 충돌 방지
+            raw = _call_get_loaders(args.dataset, tok, args.nsamples, args.seed, args.seqlen)
+            raw_loader = _pick_split(raw, args.split)
+            print(f"  raw_loader type: {type(raw_loader).__name__}")
 
-        del model
-        if args.device.startswith("cuda"):
-            torch.cuda.empty_cache()
+            # ★ 수정된 배치 변환: BatchEncoding/TokenizerWrapper 올바르게 처리
+            batches = prepare_batches(
+                raw_loader, tok, args.seqlen,
+                args.batch_size, args.device, args.max_batches,
+            )
+
+        print(f"  ✓ Prepared {len(batches)} batches (seqlen={args.seqlen})")
+
+        if len(batches) == 0:
+            print(f"  ✗ ERROR: 배치가 0개입니다! 데이터 로딩을 확인하세요.")
+            continue
+
+        # ── Stage별 평가 ──
+        for stage in stage_list:
+            stage_label_map = {"A": "A", "AB": "AB", "FULL": "ABC"}
+            label = f"{Path(mpath).name}[{stage_label_map.get(stage, stage)}]"
+
+            print(f"\n  [{stage}] Loading model...")
+            model = _load_model(mpath, dtype=dtype, device=args.device)
+
+            # bundle(B/C) 로딩 → DynamicStageManager
+            if stage in ("AB", "FULL"):
+                print(f"  [{stage}] Loading bundle layers and restoring...")
+                passlayer_rt = _detect_layer_return_tuple(model)
+                mgr = DynamicStageManager(
+                    model=model,
+                    device=args.device,
+                    dtype=dtype,
+                    passlayer_return_tuple=passlayer_rt,
+                    bundles_dir=Path(args.bundles_dir) if args.bundles_dir else None,
+                    B_dir=bundle_B_dir,
+                    C_dir=bundle_C_dir,
+                )
+                print(f"  Stage meta: B={mgr.B_idx}, C={mgr.C_idx}")
+                mgr.set_stage(stage)
+                print(f"  ✓ Stage {stage} set")
+
+            print(f"  [{stage}] Evaluating PPL...")
+            m = eval_ppl(model, batches)
+            print(f"\n  ┌─────────────────────────────────────────┐")
+            print(f"  │ {label:<40s}│")
+            print(f"  ├─────────────────────────────────────────┤")
+            print(f"  │ PPL      = {m['ppl']:<28.4f} │")
+            print(f"  │ Mean NLL = {m['mean_nll']:<28.6f} │")
+            print(f"  │ Tokens   = {m['tokens']:<28d} │")
+            print(f"  └─────────────────────────────────────────┘")
+            results.append({"model": mpath, "stage": stage, "label": label, **m})
+
+            # LoRA 미머지 비교
+            if model_idx == 0 and stage == "A" and args.lora_paths:
+                for lp in args.lora_paths:
+                    print(f"\n  Applying LoRA (no-merge): {lp}")
+                    model_lora = _apply_lora_no_merge(model, lp)
+                    m_lora = eval_ppl(model_lora, batches)
+                    lp_name = Path(lp).name
+                    print(f"  LoRA({lp_name}): ppl={m_lora['ppl']:.4f} | nll={m_lora['mean_nll']:.6f}")
+                    results.append({"model": mpath, "stage": "A+LoRA", "label": f"+LoRA({lp_name})", **m_lora})
+                    del model_lora
+
+            del model
+            if args.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+    # ── 요약 테이블 ──
+    if len(results) > 1:
+        print(f"\n{'=' * 70}")
+        print("Summary")
+        print(f"{'=' * 70}")
+        print(f"{'Label':<45s} {'PPL':>12s} {'Mean NLL':>12s} {'Tokens':>10s}")
+        print(f"{'─' * 45} {'─' * 12} {'─' * 12} {'─' * 10}")
+        for r in results:
+            print(f"{r['label']:<45s} {r['ppl']:>12.4f} {r['mean_nll']:>12.6f} {r['tokens']:>10d}")
+        print(f"{'=' * 70}")
 
     print("\nDone.")
 
