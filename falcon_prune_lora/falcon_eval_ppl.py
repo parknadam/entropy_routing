@@ -11,7 +11,7 @@ python -m falcon_prune_lora.falcon_eval_ppl \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --dtype bf16 \
-     --lora_A   ./falcon_lora/adapters/stageA \
+     --lora_A   ./falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
      --lora_AB  ./falcon_lora/adapters/stageAB \
      --lora_FULL ./falcon_lora/adapters/stageFULL
 """
