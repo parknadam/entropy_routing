@@ -7,6 +7,12 @@ Stage A+B:   + Bundle B loaded
 Stage A+B+C: + Bundle C loaded -> full model
 
 Each stage generates a response for "Tell me about Stuttgart."
+
+# 명령어
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1,3,2 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m falcon_prune_lora.test_model
 """
 
 import json
@@ -20,10 +26,18 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ----------------------------------------------------------
 # Paths
 # ----------------------------------------------------------
+"""
 BASE = "/home/devewha/entropy_routing/falcon_results/pruning"
 A_DIR = f"{BASE}/A"
 B_DIR = f"{BASE}/bundles/B"
 C_DIR = f"{BASE}/bundles/C"
+"""
+BASE = "/home/devewha/entropy_routing/merged_models_mistral_7b"
+A_DIR = f"{BASE}/A_merged"
+BASE = "/home/devewha/entropy_routing/falcon_results/pruning"
+B_DIR = f"{BASE}/bundles/B"
+C_DIR = f"{BASE}/bundles/C"
+
 
 PROMPT = "Tell me about Stuttgart."
 MAX_NEW_TOKENS = 128

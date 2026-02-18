@@ -7,6 +7,10 @@ Stage A+B:   + Bundle B (layers 21-24) loaded
 Stage A+B+C: + Bundle C (layers 25-28) loaded → full 32-layer model
 
 Each stage generates a response for "Tell me about Stuttgart."
+
+# 명령어
+CUDA_VISIBLE_DEVICES=2 \
+python -m mistral_prune_lora.test_model
 """
 
 import torch
@@ -19,10 +23,16 @@ from safetensors.torch import load_file
 # ──────────────────────────────────────────────
 # Paths
 # ──────────────────────────────────────────────
+"""
 BASE = "/home/devewha/entropy_routing/25_mistral_results/pruning"
 A_DIR = f"{BASE}/A"
 B_DIR = f"{BASE}/bundles/B"
 C_DIR = f"{BASE}/bundles/C"
+"""
+BASE = "/home/devewha/entropy_routing/merged_models_mistral_7b"
+A_DIR = f"{BASE}/A_merged"
+B_DIR = f"{BASE}/B_merged"
+C_DIR = f"{BASE}/C_merged"
 
 PROMPT = "[INST] Tell me about Stuttgart. [/INST]"
 MAX_NEW_TOKENS = 128

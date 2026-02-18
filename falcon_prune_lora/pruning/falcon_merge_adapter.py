@@ -3,11 +3,11 @@
 Utility to merge LoRA adapters into Falcon base models or bundles.
 
 Core behavior:
-  A merge:  pruned A model + A LoRA -> save full HF model
-  B/C merge: bundle(B/C) + LoRA -> save only merged bundle layers
+  A merge:  pruned A model + A LoRA -> save full HF model (PassLayer for B/C positions, ~10GB)
+  B/C merge: bundle(B/C) + LoRA -> save only merged bundle layers (~1.6GB)
 
 Usage:
-# A merge (full model)
+# A merge (full model, B/C positions become PassLayer)
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/A \
   --adapter_path ./falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
@@ -36,11 +36,31 @@ import re
 import shutil
 
 import torch
+import torch.nn as nn
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+# ============================================================
+# FalconPassLayer: 프루닝된 레이어 자리를 차지하는 초경량 모듈 (파라미터 0)
+# ============================================================
+class FalconPassLayer(nn.Module):
+    def __init__(self, hidden_size: int = 0):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, alibi=None, attention_mask=None,
+                position_ids=None, layer_past=None, head_mask=None,
+                use_cache=False, output_attentions=False, **kwargs):
+        if use_cache:
+            return (hidden_states, layer_past)
+        return (hidden_states,)
+
+
+# ============================================================
+# manifest / adapter config 읽기 유틸리티
+# ============================================================
 _BUNDLE_LAYER_FILE_RE = re.compile(r"^layer_(\d+)\.safetensors$")
 _LAYER_INDEX_RE = re.compile(r"(?:^|\.)(?:h|layers)\.(\d+)(?:\.|$)")
 
@@ -170,6 +190,9 @@ def _extract_layer_sd(raw_sd: dict, idx: int):
     return out if out else raw_sd
 
 
+# ============================================================
+# 모델 레이어 접근
+# ============================================================
 def _get_model_layers(model):
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         return model.transformer.h
@@ -184,6 +207,30 @@ def _get_model_layers(model):
     raise RuntimeError("Cannot find Falcon layers (expected transformer.h)")
 
 
+# ============================================================
+# PassLayer 복원
+# ============================================================
+def _restore_passlayers(model, dropped_indices: list):
+    """dropped 레이어 위치를 FalconPassLayer(파라미터 0)로 교체."""
+    if not dropped_indices:
+        return model
+    layers = _get_model_layers(model)
+    hidden_size = model.config.hidden_size
+    restored = []
+    for idx in dropped_indices:
+        if 0 <= idx < len(layers):
+            old = layers[idx]
+            layers[idx] = FalconPassLayer(hidden_size)
+            del old
+            restored.append(idx)
+    if restored:
+        print(f"  [ok] FalconPassLayer restored: {len(restored)} layers {restored}")
+    return model
+
+
+# ============================================================
+# Bundle 레이어 주입
+# ============================================================
 def _inject_bundle_layers_into_model(model, bundle_dir: str, indices: list):
     if not indices:
         return
@@ -212,6 +259,9 @@ def _inject_bundle_layers_into_model(model, bundle_dir: str, indices: list):
         print(f"    [ok] layer {idx} <- {os.path.basename(sf_path)}")
 
 
+# ============================================================
+# 출력 디렉터리 / 저장
+# ============================================================
 def _clear_output_dir(output_dir: str):
     if not os.path.isdir(output_dir):
         return
@@ -265,6 +315,44 @@ def _save_bundle_only(model, output_dir: str, layer_indices: list, source_bundle
     print(f"  Total bundle size: {total_bytes / (1024**3):.2f} GB")
 
 
+def _save_complete_model(model, tokenizer, output_dir: str, base_model_path: str = None):
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("  Saving model weights...")
+    model.save_pretrained(output_dir, safe_serialization=True)
+    print("  Saving tokenizer...")
+    tokenizer.save_pretrained(output_dir)
+
+    try:
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            model.generation_config.save_pretrained(output_dir)
+            print("  Saved generation_config.")
+    except Exception:
+        if base_model_path:
+            gen_cfg_file = os.path.join(base_model_path, "generation_config.json")
+            if os.path.isfile(gen_cfg_file):
+                shutil.copy2(gen_cfg_file, os.path.join(output_dir, "generation_config.json"))
+                print("  Copied generation_config from base model.")
+
+    if base_model_path:
+        manifest_src = os.path.join(base_model_path, "manifest.json")
+        if os.path.isfile(manifest_src):
+            shutil.copy2(manifest_src, os.path.join(output_dir, "manifest.json"))
+            print("  Copied manifest.json.")
+
+    saved_files = sorted(os.listdir(output_dir))
+    total_bytes = sum(
+        os.path.getsize(os.path.join(output_dir, f))
+        for f in saved_files
+        if os.path.isfile(os.path.join(output_dir, f))
+    )
+    print(f"  Saved files: {saved_files}")
+    print(f"  Total size: {total_bytes / (1024**3):.2f} GB")
+
+
+# ============================================================
+# 타겟 레이어 결정 / LoRA scope 강제
+# ============================================================
 def _resolve_target_layers(base_model_path: str, adapter_path: str, stage_info: dict = None):
     if stage_info is None:
         stage_info = _read_stage_layers_from_manifest(base_model_path)
@@ -288,6 +376,41 @@ def _resolve_target_layers(base_model_path: str, adapter_path: str, stage_info: 
         print(f"  Target layers ({source}): {target_layers}")
 
     return stage, target_layers
+
+
+def _read_dropped_layers_from_manifest(base_model_path: str, merge_stage: str = None, stage_info: dict = None):
+    """
+    merge stage에 맞춰 FalconPassLayer로 복원할 레이어 결정.
+      A: B+C 전부 PassLayer
+      B: C만 PassLayer
+      C: 복원 없음 (FULL)
+    """
+    if stage_info is None:
+        stage_info = _read_stage_layers_from_manifest(base_model_path)
+
+    A_dropped = stage_info["A_dropped"]
+    B_removed = stage_info["B_removed"]
+    C_removed = stage_info["C_removed"]
+    simdrop_removed = stage_info["simdrop_removed"]
+
+    if merge_stage == "B":
+        if C_removed:
+            return C_removed
+        if A_dropped and B_removed:
+            return _unique_sorted_ints(set(A_dropped) - set(B_removed))
+        return []
+
+    if merge_stage == "C":
+        return []
+
+    # Stage A / fallback
+    if A_dropped:
+        return A_dropped
+    if B_removed or C_removed:
+        return _unique_sorted_ints(B_removed + C_removed)
+    if simdrop_removed:
+        return simdrop_removed
+    return []
 
 
 def _extract_layer_idx(name: str):
@@ -378,6 +501,9 @@ def _enforce_adapter_scope(model, target_layers: list):
     print(f"  [ok] Effective merge target layers: {target_layers}")
 
 
+# ============================================================
+# 토크나이저 (다중 폴백)
+# ============================================================
 def _resolve_tokenizer(*candidate_paths: str, trust_remote_code: bool = True):
     errors = []
     for path in candidate_paths:
@@ -434,41 +560,9 @@ def _device_map_from_arg(device: str):
     return {"": device}
 
 
-def _save_complete_model(model, tokenizer, output_dir: str, base_model_path: str = None):
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("  Saving model weights...")
-    model.save_pretrained(output_dir, safe_serialization=True)
-    print("  Saving tokenizer...")
-    tokenizer.save_pretrained(output_dir)
-
-    try:
-        if hasattr(model, "generation_config") and model.generation_config is not None:
-            model.generation_config.save_pretrained(output_dir)
-            print("  Saved generation_config.")
-    except Exception:
-        if base_model_path:
-            gen_cfg_file = os.path.join(base_model_path, "generation_config.json")
-            if os.path.isfile(gen_cfg_file):
-                shutil.copy2(gen_cfg_file, os.path.join(output_dir, "generation_config.json"))
-                print("  Copied generation_config from base model.")
-
-    if base_model_path:
-        manifest_src = os.path.join(base_model_path, "manifest.json")
-        if os.path.isfile(manifest_src):
-            shutil.copy2(manifest_src, os.path.join(output_dir, "manifest.json"))
-            print("  Copied manifest.json.")
-
-    saved_files = sorted(os.listdir(output_dir))
-    total_bytes = sum(
-        os.path.getsize(os.path.join(output_dir, f))
-        for f in saved_files
-        if os.path.isfile(os.path.join(output_dir, f))
-    )
-    print(f"  Saved files: {saved_files}")
-    print(f"  Total size: {total_bytes / (1024**3):.2f} GB")
-
-
+# ============================================================
+# 검증
+# ============================================================
 def _verify_merged_model(output_dir: str):
     print(f"\n[Verify] Checking merged model at {output_dir}...")
     abs_dir = os.path.abspath(output_dir)
@@ -515,6 +609,9 @@ def _verify_bundle_output(output_dir: str):
     return ok
 
 
+# ============================================================
+# 단일 어댑터 머지
+# ============================================================
 def merge_single_adapter(
     base_model_path: str,
     adapter_path: str,
@@ -525,6 +622,7 @@ def merge_single_adapter(
     save_bundle_only: bool = False,
     force_full_model: bool = False,
 ):
+    """단일 LoRA 어댑터를 베이스 모델에 머지합니다."""
     print(f"\n{'=' * 60}")
     print("Merging Adapter into Base Model (Falcon)")
     print(f"{'=' * 60}")
@@ -534,6 +632,7 @@ def merge_single_adapter(
     if tokenizer_path:
         print(f"Tokenizer:   {tokenizer_path}")
 
+    # ── base_model이 HF 모델인지 bundle 디렉터리인지 판별 ──
     bundle_mode = False
     bundle_dir = None
     bundle_indices = []
@@ -544,6 +643,7 @@ def merge_single_adapter(
         if bundle_indices:
             bundle_mode = True
             bundle_dir = base_model_path
+
             if not save_bundle_only and not force_full_model:
                 save_bundle_only = True
                 print("  [mode] Bundle dir detected -> auto-enabled bundle-only save mode")
@@ -570,7 +670,8 @@ def merge_single_adapter(
                 f"--base_model has neither config.json nor bundle layer files: {base_model_path}"
             )
 
-    print("\n[1/5] Reading manifest/adapter for layer routing...")
+    # [1/6] manifest + adapter에서 레이어 라우팅 정보
+    print("\n[1/6] Reading manifest/adapter for layer routing...")
     stage_info = _read_stage_layers_from_manifest(effective_base_model_path)
     adapter_stage, target_layers = _resolve_target_layers(
         effective_base_model_path, adapter_path, stage_info
@@ -578,26 +679,39 @@ def merge_single_adapter(
     if bundle_mode and not target_layers:
         target_layers = list(bundle_indices)
 
+    dropped_layers = _read_dropped_layers_from_manifest(
+        effective_base_model_path, merge_stage=adapter_stage, stage_info=stage_info,
+    )
+
     if adapter_stage:
         print(f"  Adapter stage: {adapter_stage}")
-    if bundle_mode and target_layers and set(target_layers) != set(bundle_indices):
-        print(
-            "  [warn] target layers from manifest/config differ from bundle indices. "
-            f"target={target_layers}, bundle={bundle_indices}"
-        )
-
-    tokenizer = None
-    if save_bundle_only:
-        print("\n[2/5] Skipping tokenizer load (bundle-only save)")
+    if bundle_mode:
+        print(f"  Save mode: bundle-only (layers {bundle_indices} only)")
+        if target_layers and set(target_layers) != set(bundle_indices):
+            print(
+                f"  [warn] target layers from manifest/config differ from bundle indices. "
+                f"target={target_layers}, bundle={bundle_indices}"
+            )
     else:
-        print("\n[2/5] Loading tokenizer...")
+        if dropped_layers:
+            print(f"  PassLayer targets: {dropped_layers} ({len(dropped_layers)} layers)")
+        else:
+            print(f"  PassLayer targets: none")
+
+    # [2/6] 토크나이저 로드
+    if save_bundle_only:
+        print("\n[2/6] Skipping tokenizer load (bundle-only save)")
+        tokenizer = None
+    else:
+        print("\n[2/6] Loading tokenizer...")
         tok_candidates = _find_tokenizer_candidates(effective_base_model_path, adapter_path, tokenizer_path)
         tokenizer = _resolve_tokenizer(*tok_candidates)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             print(f"  Set pad_token = eos_token ({tokenizer.eos_token})")
 
-    print("\n[3/5] Loading base model...")
+    # [3/6] 스켈레톤 모델 로드 (+ bundle 레이어 주입)
+    print("\n[3/6] Loading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         effective_base_model_path,
         torch_dtype=torch.float16,
@@ -610,17 +724,26 @@ def merge_single_adapter(
     if bundle_mode:
         _inject_bundle_layers_into_model(base_model, bundle_dir, bundle_indices)
 
-    print("\n[4/5] Loading and merging adapter...")
+    # [4/6] 어댑터 로드 & 머지
+    print("\n[4/6] Loading and merging adapter...")
     model = PeftModel.from_pretrained(base_model, adapter_path)
     _enforce_adapter_scope(model, target_layers)
     merged_model = model.merge_and_unload()
     print("  [ok] LoRA weights fused into base model")
 
-    print("\n[5/5] Saving merged output...")
+    # [5/6] PassLayer 복원 (전체 모델 저장 시만)
+    if save_bundle_only:
+        print("\n[5/6] Skipping PassLayer restore (bundle-only save)")
+    else:
+        print("\n[5/6] Restoring FalconPassLayers for dropped layers...")
+        merged_model = _restore_passlayers(merged_model, dropped_layers)
+
+    # [6/6] 저장
     if save_bundle_only:
         bundle_save_indices = bundle_indices if bundle_indices else target_layers
         if not bundle_save_indices:
             raise RuntimeError("save_bundle_only=True but no layer indices resolved.")
+        print(f"\n[6/6] Saving bundle-only (layers {bundle_save_indices}) to {output_dir}...")
         _save_bundle_only(
             merged_model,
             output_dir=output_dir,
@@ -628,8 +751,10 @@ def merge_single_adapter(
             source_bundle_dir=bundle_dir,
         )
     else:
+        print(f"\n[6/6] Saving complete merged model to {output_dir}...")
         _save_complete_model(merged_model, tokenizer, output_dir, effective_base_model_path)
 
+    # 정리 & 검증
     del merged_model, model, base_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -648,6 +773,9 @@ def merge_single_adapter(
     return output_dir
 
 
+# ============================================================
+# 다중 어댑터 순차 머지
+# ============================================================
 def merge_multiple_adapters(
     base_model_path: str,
     adapter_paths: list,
@@ -656,6 +784,7 @@ def merge_multiple_adapters(
     tokenizer_path: str = None,
     verify: bool = True,
 ):
+    """여러 LoRA 어댑터를 순차적으로 머지합니다."""
     if not _is_hf_model_dir(base_model_path):
         raise ValueError("merge_multiple_adapters requires HF base model dir (config.json).")
 
@@ -690,7 +819,13 @@ def merge_multiple_adapters(
         print(f"Stage {i}/{len(adapter_paths)}: {os.path.basename(adapter_path)}")
         print(f"{'-' * 40}")
 
-        _, target_layers = _resolve_target_layers(base_model_path, adapter_path, stage_info)
+        adapter_stage, target_layers = _resolve_target_layers(base_model_path, adapter_path, stage_info)
+        dropped_layers = _read_dropped_layers_from_manifest(
+            base_model_path, merge_stage=adapter_stage, stage_info=stage_info,
+        )
+        if adapter_stage:
+            print(f"  Adapter stage: {adapter_stage}")
+        print(f"  PassLayer targets: {dropped_layers if dropped_layers else '[]'}")
 
         print(f"  Loading model from {current_model_path}...")
         model = AutoModelForCausalLM.from_pretrained(
@@ -705,6 +840,9 @@ def merge_multiple_adapters(
         _enforce_adapter_scope(model, target_layers)
         merged_model = model.merge_and_unload()
         print(f"  [ok] Merged stage {i}")
+
+        print(f"  Restoring FalconPassLayers...")
+        merged_model = _restore_passlayers(merged_model, dropped_layers)
 
         if is_last:
             print(f"\n  Saving final model to {output_dir}...")
@@ -736,25 +874,28 @@ def merge_multiple_adapters(
     return output_dir
 
 
+# ============================================================
+# CLI
+# ============================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Merge LoRA adapter(s) into Falcon base model or bundle",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # A merge (full model)
+  # A merge (full model, B/C become PassLayer ~10GB)
   python -m falcon_prune_lora.pruning.falcon_merge_adapter \\
     --base_model ./falcon_results/pruning/A \\
     --adapter_path ./falcon_kd_lora_results/adapters/A_lora/stageA \\
     --output_dir ./merged_models_falcon/A_merged
 
-  # B merge (bundle-only auto mode)
+  # B merge (bundle-only ~1.6GB)
   python -m falcon_prune_lora.pruning.falcon_merge_adapter \\
     --base_model ./falcon_results/pruning/bundles/B \\
     --adapter_path ./falcon_kd_lora_results/adapters/B_lora/stageB \\
     --output_dir ./merged_models_falcon/B_merged
 
-  # C merge (bundle-only auto mode)
+  # C merge (bundle-only ~1.6GB)
   python -m falcon_prune_lora.pruning.falcon_merge_adapter \\
     --base_model ./falcon_results/pruning/bundles/C \\
     --adapter_path ./falcon_kd_lora_results/adapters/C_lora/stageC \\

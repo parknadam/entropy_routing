@@ -87,6 +87,7 @@ def _clean_auto_map(model_dir: str):
     """
     로컬 저장 모델의 config.json에서 auto_map 필드 제거.
     trust_remote_code=True 없이 로드할 수 있게 함.
+    원본은 config.json.bak으로 백업.
     """
     cfg_path = os.path.join(model_dir, "config.json")
     if not os.path.isfile(cfg_path):
@@ -95,10 +96,15 @@ def _clean_auto_map(model_dir: str):
         with open(cfg_path, "r") as f:
             cfg = json.load(f)
         if "auto_map" in cfg:
+            # 백업 (최초 1회만)
+            bak_path = cfg_path + ".bak"
+            if not os.path.isfile(bak_path):
+                import shutil
+                shutil.copy2(cfg_path, bak_path)
             del cfg["auto_map"]
             with open(cfg_path, "w") as f:
                 json.dump(cfg, f, indent=2)
-            print(f"[config] Removed auto_map from {cfg_path}")
+            print(f"[config] Removed auto_map from {cfg_path} (backup: {bak_path})")
     except Exception as e:
         print(f"[warn] Failed to clean auto_map: {e}")
 
@@ -147,25 +153,36 @@ def _load_bundle_indices(bundle_dir: str) -> list:
 
 
 def _get_present_layer_indices_from_safetensors(model_dir: str) -> list:
-    """safetensors에서 실제 존재하는 transformer.h.{i} 인덱스 추출"""
-    st_path = os.path.join(model_dir, "model.safetensors")
-    if not os.path.isfile(st_path):
+    """safetensors에서 실제 존재하는 transformer.h.{i} 인덱스 추출 (샤딩 대응)"""
+    # 단일 파일 또는 샤딩된 파일 모두 탐색
+    st_files = []
+    single = os.path.join(model_dir, "model.safetensors")
+    if os.path.isfile(single):
+        st_files.append(single)
+    else:
+        # 샤딩된 파일 탐색: model-00001-of-00002.safetensors 등
+        for fname in os.listdir(model_dir):
+            if fname.startswith("model-") and fname.endswith(".safetensors"):
+                st_files.append(os.path.join(model_dir, fname))
+
+    if not st_files:
         return []
 
     present = set()
     try:
-        with safe_open(st_path, framework="pt", device="cpu") as f:
-            for k in f.keys():
-                if not k.startswith("transformer.h."):
-                    continue
-                parts = k.split(".")
-                if len(parts) < 3:
-                    continue
-                try:
-                    idx = int(parts[2])
-                except ValueError:
-                    continue
-                present.add(idx)
+        for st_path in st_files:
+            with safe_open(st_path, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if not k.startswith("transformer.h."):
+                        continue
+                    parts = k.split(".")
+                    if len(parts) < 3:
+                        continue
+                    try:
+                        idx = int(parts[2])
+                    except ValueError:
+                        continue
+                    present.add(idx)
     except Exception as e:
         print(f"[warn] safetensors layer index scan failed: {e}")
         return []
@@ -367,15 +384,43 @@ def _rehydrate_layers(model, bundle_dir: str, indices):
 # ============================================================
 # LoRA 어댑터 관리
 # ============================================================
+def _detect_falcon_lora_targets(model) -> list:
+    """
+    Falcon 아키텍처에 맞는 LoRA target_modules 자동 감지.
+    - falcon-7b (multi_query): query_key_value, dense, dense_h_to_4h, dense_4h_to_h
+    - falcon-40b+ (new_decoder_architecture): q_proj, k_proj, v_proj, dense, dense_h_to_4h, dense_4h_to_h
+    """
+    cfg = model.config
+    new_arch = getattr(cfg, "new_decoder_architecture", False)
+
+    if new_arch:
+        targets = ["q_proj", "k_proj", "v_proj", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+    else:
+        targets = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+
+    # 실제 존재하는 모듈명으로 검증
+    param_names = {n for n, _ in model.named_parameters()}
+    verified = [t for t in targets if any(t in n for n in param_names)]
+
+    if not verified:
+        print(f"[warn] No matching LoRA target modules found. Falling back to defaults.")
+        verified = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+
+    print(f"[LoRA] target_modules: {verified}")
+    return verified
+
+
 def _attach_new_adapter(model, adapter_name: str, r=8, alpha=16, dropout=0.05,
                         target_layers=None):
     """
     Falcon용 LoRA 어댑터 추가.
     target_layers: 지정하면 해당 레이어에만 LoRA 적용 (layers_to_transform).
+    target_modules는 모델 config에서 자동 감지.
     """
+    target_modules = _detect_falcon_lora_targets(model)
     cfg = LoraConfig(
         r=r, lora_alpha=alpha, lora_dropout=dropout,
-        target_modules=["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
+        target_modules=target_modules,
         bias="none", task_type="CAUSAL_LM",
         layers_to_transform=target_layers,
     )
@@ -394,10 +439,11 @@ def load_teacher(args):
         return None
 
     print(f"\n[Teacher] Loading {args.teacher_model} on {args.teacher_device}")
+    # ★ trust_remote_code 사용하지 않음 (Hub의 구버전 커스텀 코드가 최신 PyTorch와 비호환)
+    #   transformers>=4.33은 Falcon을 네이티브 지원
     kwargs = {
         "torch_dtype": torch.float16,
-        "device_map": args.teacher_device,
-        "trust_remote_code": True,
+        "device_map": {"": args.teacher_device},
     }
     if args.teacher_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
