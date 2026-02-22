@@ -12,8 +12,8 @@ python -m falcon_prune_lora.falcon_eval_ppl \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --dtype bf16 \
      --lora_A   ./falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
-     --lora_AB  ./falcon_lora/adapters/stageAB \
-     --lora_FULL ./falcon_lora/adapters/stageFULL
+     --lora_AB  ./falcon_kd_lora_results/adapters/B_lora/stageB \
+     --lora_FULL ./falcon_kd_lora_results/adapters/C_lora/stageC
 """
 
 from __future__ import annotations

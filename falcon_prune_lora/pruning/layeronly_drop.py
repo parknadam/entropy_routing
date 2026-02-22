@@ -5,7 +5,7 @@
 
 python -m falcon_prune_lora.pruning.layeronly_drop \
   --model tiiuae/falcon-7b-instruct \
-  --device cuda:6 \
+  --device cuda:0 \
   --drop_frac 0.25 \
   --keep_last_layer \
   --nsamples 64 \
