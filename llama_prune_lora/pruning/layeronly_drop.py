@@ -24,6 +24,18 @@ python -m prune_lora.pruning.layeronly_drop \
   --save_dir /dev/shm/7b_results/pruning/A \
   --save_removed_dir /dev/shm/7b_results/pruning/bundles
 
+# 13b
+python -m llama_prune_lora.pruning.layeronly_drop \
+  --model meta-llama/Llama-2-13b-chat-hf \
+  --device cuda:2 \
+  --drop_frac 0.31 \
+  --keep_last_layer \
+  --nsamples 64 \
+  --seqlen 2048 \
+  --max_batches 32 \
+  --save_dir ./3_13b_results/pruning/A \
+  --save_removed_dir ./3_13b_results/pruning/bundles
+
 """
 
 import argparse

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Progressive Model Loading Test (Merged Version)
-=================================================
-Stage A:     Full 32-layer skeleton loaded, layers 21-28 replaced with PassLayer
-Stage A+B:   + B_merged layers (21-24) restored
-Stage A+B+C: + C_merged layers (25-28) restored → full 32-layer model
+Progressive Model Loading Test
+===============================
+Stage A:     Kept layers (0-20, 29-31) only, dropped layers (21-28) are PassLayer
+Stage A+B:   + Bundle B (layers 21-24) loaded
+Stage A+B+C: + Bundle C (layers 25-28) loaded → full 32-layer model
 
 Each stage generates a response for "Tell me about Stuttgart."
 """
@@ -19,12 +19,11 @@ from safetensors.torch import load_file
 # ──────────────────────────────────────────────
 # Paths
 # ──────────────────────────────────────────────
-'''
-BASE = "/home/devewha/K_ProgressiveServe/merged_models_llama2_7b"
-A_DIR = f"{BASE}/A_merged"
-B_DIR = f"{BASE}/B_merged"
-C_DIR = f"{BASE}/C_merged"
-'''
+BASE = "/home/devewha/entropy_routing/13b_results/pruning"
+A_DIR = f"{BASE}/A"
+B_DIR = f"{BASE}/bundles/B"
+C_DIR = f"{BASE}/bundles/C"
+
 PROMPT = "[INST] Tell me about Stuttgart. [/INST]"
 MAX_NEW_TOKENS = 128
 
@@ -51,12 +50,16 @@ def load_bundle_into_layer(model, bundle_dir, layer_indices, device):
     """
     Load individual layer safetensors from a bundle directory
     into the corresponding model layers.
+
+    Bundle files have short keys like "self_attn.q_proj.weight"
+    that match the layer's own state_dict keys directly.
     """
     for idx in layer_indices:
-        sf_path = f"{bundle_dir}/layer_{idx}.safetensors"
+        sf_path = f"{bundle_dir}/layer_{idx:03d}.safetensors"
         weights = load_file(sf_path, device=str(device))
 
         layer = model.model.layers[idx]
+        # strict=False in case the layer has extra buffers (e.g. rotary_emb)
         missing, unexpected = layer.load_state_dict(weights, strict=False)
         if unexpected:
             print(f"  [!] Layer {idx}: unexpected keys {unexpected}")
@@ -77,6 +80,7 @@ def generate_text(model, tokenizer, prompt, device, max_new_tokens=MAX_NEW_TOKEN
     )
     elapsed = time.time() - t0
 
+    # Decode only the newly generated tokens
     new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
     n_tokens = len(new_ids)
@@ -98,31 +102,34 @@ def print_response(stage_name, text, elapsed, n_tokens):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    # ── Load layer indices from bundle_meta.json ──
-    with open(f"{B_DIR}/bundle_meta.json") as f:
-        b_layers = json.load(f)["layer_indices"]
-    with open(f"{C_DIR}/bundle_meta.json") as f:
-        c_layers = json.load(f)["layer_indices"]
-    dropped = sorted(b_layers + c_layers)
+    # ── Load manifest ───────────────────────────
+    with open(f"{A_DIR}/manifest.json") as f:
+        manifest = json.load(f)
+
+    a_kept    = manifest["stages"]["A"]["kept_layers"]       # [0..20, 29..31]
+    a_dropped = manifest["stages"]["A"]["dropped_layers"]    # [21..28]
+    b_layers  = manifest["stages"]["B"]["removed_layers"]    # [21..24]
+    c_layers  = manifest["stages"]["C"]["removed_layers"]    # [25..28]
 
     print("=" * 70)
-    print("  Progressive Model Loading Test (Merged)")
+    print("  Progressive Model Loading Test")
     print("=" * 70)
-    print(f"  Dropped layers:    {dropped}")
+    print(f"  Kept layers (A):   {a_kept}")
+    print(f"  Dropped layers:    {a_dropped}")
     print(f"  Bundle B layers:   {b_layers}")
     print(f"  Bundle C layers:   {c_layers}")
     print(f"  Prompt: {PROMPT}")
     print("=" * 70)
 
     # ── 1. Load tokenizer ──────────────────────
-    print("\n[1/5] Loading tokenizer ...")
+    print("\n[1/6] Loading tokenizer ...")
     tokenizer = LlamaTokenizerFast.from_pretrained(A_DIR)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # ── 2. Load model (full 32 layers, layers 21-28 are init weights) ──
-    print("[2/5] Loading model from A_merged ...")
-    device = torch.device("cuda:0")
+    # ── 2. Load model (32 layers; layers 21-28 will have random-init weights) ──
+    print("[2/6] Loading model from Stage A checkpoint ...")
+    device = torch.device("cuda:3")
     model = AutoModelForCausalLM.from_pretrained(
         A_DIR,
         dtype=torch.float16,
@@ -131,13 +138,13 @@ def main():
     print(f"  Model loaded on {device}  "
           f"(layers={model.config.num_hidden_layers})")
 
-    # ── 3. Save original layers 21-28, then replace with PassLayer ──
-    print("[3/5] Replacing dropped layers with PassLayer ...")
+    # ── 3. Save original layers 21-28 (random-init), then replace with PassLayer ──
+    print("[3/6] Replacing dropped layers with PassLayer ...")
     original_layers = {}
-    for idx in dropped:
+    for idx in a_dropped:
         original_layers[idx] = model.model.layers[idx]
         model.model.layers[idx] = PassLayer().to(device)
-    print(f"  Layers {dropped} → PassLayer")
+    print(f"  Layers {a_dropped} → PassLayer")
 
     # ═══════════════════════════════════════════
     # Stage A  (24 active layers)
@@ -153,10 +160,10 @@ def main():
     # Stage A+B  (28 active layers)
     # ═══════════════════════════════════════════
     print("=" * 70)
-    print("  Stage A+B : Loading B_merged (layers 21-24)")
+    print("  Stage A+B : Loading Bundle B (layers 21-24)")
     print("=" * 70)
 
-    print("[4/5] Restoring layers 21-24 and loading B_merged weights ...")
+    print("[4/6] Restoring layers 21-24 and loading Bundle B weights ...")
     for idx in b_layers:
         model.model.layers[idx] = original_layers[idx]
     load_bundle_into_layer(model, B_DIR, b_layers, device)
@@ -168,10 +175,10 @@ def main():
     # Stage A+B+C  (32 active layers — full model)
     # ═══════════════════════════════════════════
     print("=" * 70)
-    print("  Stage A+B+C : Loading C_merged (layers 25-28) → Full Model")
+    print("  Stage A+B+C : Loading Bundle C (layers 25-28) → Full Model")
     print("=" * 70)
 
-    print("[5/5] Restoring layers 25-28 and loading C_merged weights ...")
+    print("[5/6] Restoring layers 25-28 and loading Bundle C weights ...")
     for idx in c_layers:
         model.model.layers[idx] = original_layers[idx]
     load_bundle_into_layer(model, C_DIR, c_layers, device)

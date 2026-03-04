@@ -38,6 +38,15 @@ python -m prune_lora.eval_ppl \
      --lora_AB ./kd_lora_results/adapters/B_lora/stageB \
      --lora_FULL ./adapters/stageFULL
 
+# 13b
+python -m llama_prune_lora.eval_ppl \
+     --base_model ./3_13b_results/pruning/A \
+     --bundles_dir ./3_13b_results/pruning/bundles \
+     --text_file ./data/wikitext2_test.txt \
+     --seqlen 2048 --batch_size 1 --max_batches 64 \
+     --device cuda:2 --dtype bf16 
+
+
 
 """
    
