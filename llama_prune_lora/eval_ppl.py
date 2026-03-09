@@ -39,12 +39,13 @@ python -m prune_lora.eval_ppl \
      --lora_FULL ./adapters/stageFULL
 
 # 13b
+CUDA_VISIBLE_DEVICES=2 \
 python -m llama_prune_lora.eval_ppl \
-     --base_model ./3_13b_results/pruning/A \
-     --bundles_dir ./3_13b_results/pruning/bundles \
+     --base_model ./32_13b_results/pruning/A \
+     --bundles_dir ./32_13b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 2048 --batch_size 1 --max_batches 64 \
-     --device cuda:2 --dtype bf16 
+     --device cuda:0 --dtype bf16 
 
 
 

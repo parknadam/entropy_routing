@@ -9,7 +9,7 @@ Stage 2: B 번들 복원 후 AB 레이어에 LoRA → stageAB
 사용법:
 # Stage 1
 CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
-python -m llama_prune_lora.llama_optimized_kd_lora \
+python -m llama_prune_lora.optimized_kd_lora \
   --base_dir ./7b_results/pruning/A \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 \

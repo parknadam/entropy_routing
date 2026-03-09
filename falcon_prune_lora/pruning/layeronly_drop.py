@@ -14,6 +14,17 @@ python -m falcon_prune_lora.pruning.layeronly_drop \
   --save_dir ./falcon_results/pruning/A \
   --save_removed_dir ./falcon_results/pruning/bundles
 
+python -m falcon_prune_lora.pruning.layeronly_drop \
+  --model tiiuae/Falcon3-10B-Instruct \
+  --device cuda:0 \
+  --drop_frac 0.25 \
+  --keep_last_layer \
+  --nsamples 64 \
+  --seqlen 1024 \
+  --max_batches 32 \
+  --save_dir ./falcon_results/pruning/A \
+  --save_removed_dir ./falcon_results/pruning/bundles
+
 # Falcon-40B-Instruct 예시
 python -m falcon_prune_lora.pruning.layeronly_drop \
   --model tiiuae/falcon-10b-instruct \

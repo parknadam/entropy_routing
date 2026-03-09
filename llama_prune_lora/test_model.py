@@ -7,6 +7,10 @@ Stage A+B:   + Bundle B (layers 21-24) loaded
 Stage A+B+C: + Bundle C (layers 25-28) loaded → full 32-layer model
 
 Each stage generates a response for "Tell me about Stuttgart."
+
+CUDA_VISIBLE_DEVICES=2 \
+python -m llama_prune_lora.test_model
+
 """
 
 import torch
