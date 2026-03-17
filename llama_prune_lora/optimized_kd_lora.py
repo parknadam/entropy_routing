@@ -1,50 +1,59 @@
 #!/usr/bin/env python3
 """
-LLaMA 구조용 최적화 KD-LoRA 학습 코드
+LLaMA 구조용 최적화 KD-LoRA 학습 코드 (expand 방식)
 
-layeronly_drop.py로 프루닝된 LLaMA 모델(A)에 LoRA를 붙여 KD 학습.
-Stage 1: A 모델의 남은 레이어에 LoRA → stageA
-Stage 2: B 번들 복원 후 AB 레이어에 LoRA → stageAB
+핵심:
+  layeronly_drop.py가 물리적으로 제거한 compact 모델(24층)을
+  원본 크기(32층)로 확장한 뒤, 제거된 위치에 PassLayer를 삽입.
+  이후 원본 인덱스 기준으로 LoRA 훈련.
+
+Stage 1: A 로드 → 32층 expand → B,C=PassLayer → A 레이어에만 LoRA
+Stage 2: A_merged 로드 → 32층 expand → B 복원 + C=PassLayer → B 레이어에만 LoRA
+Stage 3: A_merged 로드 → 32층 expand → B_merged 복원 + C 복원 → C 레이어에만 LoRA
 
 사용법:
 # Stage 1
 CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
-python -m llama_prune_lora.optimized_kd_lora \
+python -m llama_prune_lora.llama_optimized_kd_lora \
   --base_dir ./7b_results/pruning/A \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 \
   --out_adapters ./llama_kd_lora_results/adapters \
-  --qa_dataset squad \
-  --max_samples 20000 \
-  --max_eval_samples 8000 \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
   --teacher_4bit --teacher_device cuda:1 \
   --kd_alpha 0.1 --kd_T 2.0
 
-# Stage 2 (A merged 모델 기준)
+# Stage 2 (A_merged 기준)
+CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
 python -m llama_prune_lora.llama_optimized_kd_lora \
   --base_dir ./merged_models_llama_7b/A_merged \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 2 \
   --out_adapters ./llama_kd_lora_results/adapters \
-  --qa_dataset squad \
-  --max_samples 20000 \
-  --max_eval_samples 8000 \
-  --seq_len 1024 \
-  --lr 3e-4 \
-  --epochs 1 \
-  --bs 1 \
-  --grad_acc 32 \
-  --use_kd \
-  --teacher_model meta-llama/Llama-2-7b-chat-hf \
-  --teacher_4bit \
-  --teacher_device cuda:1 \
-  --kd_alpha 0.1 \
-  --kd_T 2.0
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
+  --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
+  --teacher_4bit --teacher_device cuda:1 \
+  --kd_alpha 0.1 --kd_T 2.0
+
+# Stage 3 (A_merged + B_merged)
+CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
+python -m llama_prune_lora.llama_optimized_kd_lora \
+  --base_dir ./merged_models_llama_7b/A_merged \
+  --b_merged_dir ./merged_models_llama_7b/B_merged \
+  --bundles_dir ./7b_results/pruning/bundles/C \
+  --stage 3 \
+  --out_adapters ./llama_kd_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
+  --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
+  --teacher_4bit --teacher_device cuda:1 \
+  --kd_alpha 0.1 --kd_T 2.0
 """
 
-import os, json, re, math
+import os, json, re, math, inspect
 from typing import List
 import torch
 import torch.nn as nn
@@ -59,7 +68,7 @@ from safetensors.torch import load_file
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 # ============================================================
-# 유틸리티: 레이어 관리
+# 레이어 관리
 # ============================================================
 CANON_PATH = "model.layers"
 _LAYER_RE = re.compile(r"\blayers\.(\d+)\.")
@@ -78,7 +87,6 @@ def _canonicalize_layers(model):
         "model.layers", "model.model.layers",
         "base_model.model.layers", "base_model.model.model.layers",
         "model.decoder.layers", "model.model.decoder.layers",
-        "base_model.model.decoder.layers",
     ]
     for path in candidates:
         try:
@@ -106,6 +114,13 @@ def _get_layer_container(model):
     return model._canonical_layers
 
 
+def _invalidate_layer_cache(model):
+    """expand 후 캐시 무효화."""
+    for attr in ("_canonical_layers", "_canonical_layers_path"):
+        if hasattr(model, attr):
+            delattr(model, attr)
+
+
 def _layer_name_prefix(model, i: int):
     if not hasattr(model, "_canonical_layers_path"):
         _canonicalize_layers(model)
@@ -113,15 +128,96 @@ def _layer_name_prefix(model, i: int):
 
 
 # ============================================================
-# 번들 검증 및 레이어 복원
+# PassLayer
+# ============================================================
+def _decoder_layer_returns_tuple() -> bool:
+    try:
+        sig = inspect.signature(LlamaDecoderLayer.forward)
+    except Exception:
+        return True
+    if "output_attentions" in sig.parameters:
+        return True
+    ret = sig.return_annotation
+    if ret is inspect.Signature.empty:
+        return True
+    return ret is not torch.Tensor
+
+
+class LlamaPassLayer(nn.Module):
+    def __init__(self, return_tuple: bool):
+        super().__init__()
+        self.return_tuple = return_tuple
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                past_key_value=None, output_attentions=False, use_cache=False,
+                cache_position=None, position_embeddings=None, **kwargs):
+        if not self.return_tuple:
+            return hidden_states
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (None,)
+        if use_cache:
+            outputs += (None,)
+        return outputs
+
+
+# ============================================================
+# Expand: compact(24층) → 원본(32층)
+# ============================================================
+def _expand_to_original_layout(model, removed_indices, original_num_layers):
+    """
+    compact 모델을 원본 레이어 수로 확장.
+    제거된 위치에 LlamaPassLayer 삽입, 기존 레이어를 원래 인덱스로 재배치.
+
+    예: 원본 32, removed=[21..28]
+      compact[0..20] → 원본[0..20], compact[21..23] → 원본[29..31]
+      확장 후: [0..20]=실제A, [21..28]=PassLayer, [29..31]=실제A
+    """
+    layers = _get_layer_container(model)
+    current_num = len(layers)
+    removed_set = set(int(i) for i in removed_indices)
+    kept = sorted(set(range(original_num_layers)) - removed_set)
+
+    if current_num != len(kept):
+        raise ValueError(
+            f"레이어 수 불일치: 모델 {current_num}층, "
+            f"예상 {len(kept)}층 (원본 {original_num_layers} - 제거 {len(removed_indices)})"
+        )
+
+    current_layers = [layers[i] for i in range(current_num)]
+    new_layers = [None] * original_num_layers
+
+    for pruned_idx, orig_idx in enumerate(kept):
+        new_layers[orig_idx] = current_layers[pruned_idx]
+
+    dev = next(model.parameters()).device
+    use_tuple = _decoder_layer_returns_tuple()
+    for idx in removed_indices:
+        new_layers[int(idx)] = LlamaPassLayer(return_tuple=use_tuple).to(dev)
+
+    assert all(l is not None for l in new_layers), "확장 후 None 레이어 존재"
+
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        model.model.layers = nn.ModuleList(new_layers)
+    elif hasattr(model, 'model') and hasattr(model.model, 'model'):
+        model.model.model.layers = nn.ModuleList(new_layers)
+    else:
+        raise RuntimeError("model.model.layers 경로를 찾을 수 없음")
+
+    model.config.num_hidden_layers = original_num_layers
+    _invalidate_layer_cache(model)
+
+    print(f"[expand] {current_num}층 → {original_num_layers}층")
+    print(f"  실제 레이어: {kept[:5]}{'...' if len(kept) > 5 else ''} ({len(kept)}개)")
+    print(f"  PassLayer: {sorted(removed_indices)} ({len(removed_indices)}개)")
+    return model, kept
+
+
+# ============================================================
+# 번들 관리
 # ============================================================
 def _extract_layer_sd(raw_sd: dict, idx: int):
-    prefixes = [
-        f"model.layers.{idx}.",
-        f"model.model.layers.{idx}.",
-        f"layers.{idx}.",
-    ]
-    for pref in prefixes:
+    for pref in [f"model.layers.{idx}.", f"model.model.layers.{idx}.", f"layers.{idx}."]:
         out = {k[len(pref):]: v for k, v in raw_sd.items() if k.startswith(pref)}
         if out:
             return out
@@ -129,48 +225,55 @@ def _extract_layer_sd(raw_sd: dict, idx: int):
 
 
 def _pick_layer_file(bundle_dir: str, idx: int) -> str:
-    p3 = os.path.join(bundle_dir, f"layer_{int(idx):03d}.safetensors")
-    if os.path.isfile(p3):
-        return p3
-    p = os.path.join(bundle_dir, f"layer_{int(idx)}.safetensors")
-    if os.path.isfile(p):
-        return p
-    raise FileNotFoundError(f"layer file missing for {idx}: {p3} / {p}")
+    for fmt in [f"layer_{int(idx):03d}.safetensors", f"layer_{int(idx)}.safetensors"]:
+        p = os.path.join(bundle_dir, fmt)
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(f"layer file missing for {idx} in {bundle_dir}")
 
 
-def _assert_bundle_files_exist(bundles_dir: str, group: str, indices: list):
-    group_dir = os.path.join(bundles_dir, group)
-    if not os.path.isdir(group_dir):
-        raise FileNotFoundError(f"[bundles] group dir not found: {group_dir}")
+def _load_bundle_indices(bundle_dir: str) -> list:
+    """bundle_meta.json에서 인덱스 로드, 없으면 파일명에서 추출."""
+    meta = os.path.join(bundle_dir, "bundle_meta.json")
+    if os.path.isfile(meta):
+        with open(meta) as f:
+            return sorted(json.load(f).get("indices", []))
+    indices = []
+    for fname in os.listdir(bundle_dir):
+        m = re.match(r"layer_(\d+)\.safetensors", fname)
+        if m:
+            indices.append(int(m.group(1)))
+    return sorted(indices)
 
+
+def _assert_bundle_files_exist(bundle_dir: str, indices: list):
     missing = []
     for i in indices:
         try:
-            f = _pick_layer_file(group_dir, int(i))
+            f = _pick_layer_file(bundle_dir, int(i))
+            if os.path.getsize(f) == 0:
+                missing.append(i)
         except FileNotFoundError:
             missing.append(i)
-            continue
-        if os.path.getsize(f) == 0:
-            missing.append(i)
-
     if missing:
-        raise FileNotFoundError(f"[bundles] missing/empty files for layers: {missing}")
-    print(f"[bundles-ok] all {len(indices)} files present in {group_dir}")
+        raise FileNotFoundError(f"[bundles] missing/empty: {missing} in {bundle_dir}")
+    print(f"[bundles-ok] {len(indices)} files in {bundle_dir}")
 
 
 def _rehydrate_layers(model, bundle_dir: str, indices: List[int]):
+    """확장된 모델의 원본 인덱스 위치에 번들 레이어 복원."""
     layers = _get_layer_container(model)
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
 
     for i in indices:
         try:
-            new_layer = LlamaDecoderLayer(model.config, layer_idx=int(i)).to(device=device, dtype=dtype)
+            new_layer = LlamaDecoderLayer(model.config, layer_idx=int(i))
         except TypeError:
-            new_layer = LlamaDecoderLayer(model.config).to(device=device, dtype=dtype)
+            new_layer = LlamaDecoderLayer(model.config)
+        new_layer = new_layer.to(device=device, dtype=dtype)
 
-        f = _pick_layer_file(bundle_dir, int(i))
-        raw_sd = load_file(f)
+        raw_sd = load_file(_pick_layer_file(bundle_dir, int(i)))
         sd = _extract_layer_sd(raw_sd, int(i))
         sd = {k: v.to(device=device, dtype=dtype) for k, v in sd.items()}
 
@@ -184,46 +287,8 @@ def _rehydrate_layers(model, bundle_dir: str, indices: List[int]):
         print(f"[rehydrate] layer {i} restored")
 
 
-def _reapply_passlayers_from_manifest(model, base_dir: str):
-    man_path = os.path.join(base_dir, "manifest.json")
-    if not os.path.isfile(man_path):
-        return model
-
-    try:
-        man = json.load(open(man_path))
-        removed = (man.get("simdrop", {}) or {}).get("removed_layers")
-        if not removed:
-            removed = man.get("removed_layers")
-        if not removed:
-            stages = man.get("stages", {}) or {}
-            A_drop = (stages.get("A", {}) or {}).get("dropped_layers", [])
-            B_rem = (stages.get("B", {}) or {}).get("removed_layers", [])
-            C_rem = (stages.get("C", {}) or {}).get("removed_layers", [])
-            removed = A_drop or sorted(set(B_rem + C_rem))
-
-        if not removed:
-            return model
-        removed = sorted(set(int(i) for i in removed))
-    except Exception:
-        return model
-
-    class SafePass(nn.Module):
-        def __init__(self, hidden):
-            super().__init__()
-        def forward(self, x, *a, **kw):
-            return x
-
-    layers = _get_layer_container(model)
-    for i in removed:
-        if 0 <= i < len(layers):
-            layers[i] = SafePass(model.config.hidden_size)
-
-    print(f"[reapply] installed PassLayer on: {removed}")
-    return model
-
-
 # ============================================================
-# LoRA 어댑터 관리
+# LoRA 어댑터
 # ============================================================
 def _attach_new_adapter(model, name: str, r=8, alpha=16, dropout=0.05):
     cfg = LoraConfig(
@@ -241,26 +306,25 @@ def _attach_new_adapter(model, name: str, r=8, alpha=16, dropout=0.05):
 
 
 def _enable_only_lora_on_indices(model, indices: List[int], adapter_name: str):
+    """특정 레이어의 LoRA 파라미터만 학습 가능하게 설정."""
     for p in model.parameters():
         p.requires_grad = False
 
     layer_patterns = [_layer_name_prefix(model, i) for i in indices]
     enabled = 0
-
     for name, param in model.named_parameters():
         if any(pat in name for pat in layer_patterns) and "lora_" in name.lower():
             param.requires_grad = True
             enabled += param.numel()
 
     if enabled == 0:
-        print(f"[ERROR] No LoRA params for adapter '{adapter_name}' on layers {indices}")
-        print("Available LoRA params:")
+        print(f"[ERROR] No LoRA params on layers {indices}")
         for n, _ in model.named_parameters():
             if "lora_" in n.lower():
                 print(f"  {n}")
-        raise RuntimeError(f"No LoRA params enabled")
+        raise RuntimeError("No LoRA params enabled")
 
-    print(f"[trainable] {adapter_name}: {enabled:,} params on layers {indices}")
+    print(f"[trainable] {adapter_name}: {enabled:,} params on {len(indices)} layers")
     return enabled
 
 
@@ -280,62 +344,47 @@ def _build_chat_messages(ctx: str, q: str, dataset: str):
 def _load_qa_sft_dataset(tokenizer, qa_dataset, split, max_samples, seq_len):
     DATASET_MAP = {"squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2"}
     ds = load_dataset(DATASET_MAP.get(qa_dataset, qa_dataset), split=split)
-
     if max_samples:
         ds = ds.shuffle(seed=42).select(range(min(max_samples, len(ds))))
 
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     eos_id = tokenizer.eos_token_id
-
-    # chat template 사용 가능 여부 확인
-    has_chat_template = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
+    has_chat = hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None
 
     def to_list(x):
-        """BatchEncoding/dict/tensor/ndarray를 list[int]로 변환"""
         if hasattr(x, "input_ids"):
             x = x.input_ids
         elif isinstance(x, dict):
             x = x.get("input_ids", x)
         if hasattr(x, "tolist"):
             x = x.tolist()
-        if isinstance(x, (list, tuple)) and len(x) > 0 and isinstance(x[0], (list, tuple)):
+        if isinstance(x, (list, tuple)) and x and isinstance(x[0], (list, tuple)):
             x = x[0]
         return list(x) if x else []
 
     def process(ex):
-        ctx = ex.get("context", "")
-        q = ex.get("question", "")
+        ctx, q = ex.get("context", ""), ex.get("question", "")
         ans = (ex.get("answers", {}).get("text", [""])[0] or
                ("unanswerable" if qa_dataset == "squad_v2" else ""))
-
         messages = _build_chat_messages(ctx, q, qa_dataset)
 
-        if has_chat_template:
-            prompt_ids = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True)
-            prompt_ids = to_list(prompt_ids)
+        if has_chat:
+            prompt_ids = to_list(tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True))
         else:
-            # Llama-2 chat format fallback
-            sys_msg = messages[0]["content"]
-            user_msg = messages[1]["content"]
-            prompt = (f"<s>[INST] <<SYS>>\n{sys_msg}\n<</SYS>>\n\n"
-                      f"{user_msg} [/INST] ")
-            prompt_ids = tokenizer(prompt, add_special_tokens=False,
-                                   truncation=True, max_length=seq_len - 64)["input_ids"]
-            prompt_ids = to_list(prompt_ids)
+            sys_msg, user_msg = messages[0]["content"], messages[1]["content"]
+            prompt = f"<s>[INST] <<SYS>>\n{sys_msg}\n<</SYS>>\n\n{user_msg} [/INST] "
+            prompt_ids = to_list(tokenizer(prompt, add_special_tokens=False,
+                                           truncation=True, max_length=seq_len - 64)["input_ids"])
 
-        ans_ids = tokenizer(" " + ans, add_special_tokens=False)["input_ids"]
-        ans_ids = to_list(ans_ids)
-
+        ans_ids = to_list(tokenizer(" " + ans, add_special_tokens=False)["input_ids"])
         if eos_id:
-            ans_ids = ans_ids + [eos_id]
-
+            ans_ids += [eos_id]
         if not ans_ids:
             return {"__drop__": 1}
 
         full = prompt_ids + ans_ids
         prompt_len = len(prompt_ids)
-
         if len(full) > seq_len:
             cut = len(full) - seq_len
             full = full[cut:]
@@ -344,7 +393,6 @@ def _load_qa_sft_dataset(tokenizer, qa_dataset, split, max_samples, seq_len):
         pad_len = seq_len - len(full)
         input_ids = [pad_id] * pad_len + full
         attention_mask = [0] * pad_len + [1] * len(full)
-
         labels = input_ids[:]
         for i in range(pad_len + prompt_len):
             if i < len(labels):
@@ -352,13 +400,8 @@ def _load_qa_sft_dataset(tokenizer, qa_dataset, split, max_samples, seq_len):
 
         if pad_len + prompt_len >= seq_len:
             return {"__drop__": 1}
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-            "__drop__": 0,
-        }
+        return {"input_ids": input_ids, "attention_mask": attention_mask,
+                "labels": labels, "__drop__": 0}
 
     ds = ds.map(process, remove_columns=ds.column_names)
     ds = ds.filter(lambda x: x["__drop__"] == 0)
@@ -375,28 +418,23 @@ class KDTrainer(Trainer):
         super().__init__(*args, **kwargs)
         if teacher_model is None:
             raise ValueError("KDTrainer requires teacher_model")
-
         self.teacher_model = teacher_model.eval()
         for p in self.teacher_model.parameters():
             p.requires_grad = False
-
         self.kd_alpha = float(kd_alpha)
         self.T = float(temperature)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs["labels"]
-
         s_out = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
         s_logits_full = s_out.logits
 
         with torch.no_grad():
             t_out = self.teacher_model(
                 input_ids=inputs["input_ids"].to(self.teacher_model.device),
-                attention_mask=inputs["attention_mask"].to(self.teacher_model.device),
-            )
+                attention_mask=inputs["attention_mask"].to(self.teacher_model.device))
             t_logits_full = t_out.logits.to(s_logits_full.device)
 
-        # Causal shift
         s_logits = s_logits_full[:, :-1, :].contiguous()
         t_logits = t_logits_full[:, :-1, :].contiguous()
         labels_s = labels[:, 1:].contiguous()
@@ -404,22 +442,17 @@ class KDTrainer(Trainer):
 
         mask = (labels_s != -100) & (attn_s == 1)
         tok_n = mask.sum().item()
-
         if tok_n == 0:
             return (s_logits_full.sum() * 0.0, s_out) if return_outputs else s_logits_full.sum() * 0.0
 
         s = s_logits[mask].float().clamp(-50, 50)
         t = t_logits[mask].float().clamp(-50, 50)
         y = labels_s[mask]
-
         T = self.T
-        soft_loss = F.kl_div(
-            F.log_softmax(s / T, dim=-1),
-            F.log_softmax(t / T, dim=-1),
-            reduction="batchmean",
-            log_target=True
-        ) * (T * T)
 
+        soft_loss = F.kl_div(
+            F.log_softmax(s / T, dim=-1), F.log_softmax(t / T, dim=-1),
+            reduction="batchmean", log_target=True) * (T * T)
         hard_loss = F.cross_entropy(s, y)
 
         if not (torch.isfinite(soft_loss) and torch.isfinite(hard_loss)):
@@ -428,79 +461,55 @@ class KDTrainer(Trainer):
             loss = self.kd_alpha * soft_loss + (1 - self.kd_alpha) * hard_loss
 
         if self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0:
-            self.log({
-                "tok_n": float(tok_n),
-                "kd_soft": float(soft_loss) if torch.isfinite(soft_loss) else float("nan"),
-                "kd_hard": float(hard_loss),
-                "kd_ppl": float(math.exp(min(hard_loss.item(), 20))),
-            })
+            self.log({"tok_n": float(tok_n),
+                      "kd_soft": float(soft_loss) if torch.isfinite(soft_loss) else float("nan"),
+                      "kd_hard": float(hard_loss),
+                      "kd_ppl": float(math.exp(min(hard_loss.item(), 20)))})
 
         return (loss, s_out) if return_outputs else loss
 
 
 # ============================================================
-# 학습
+# 학습 / 티처
 # ============================================================
 def train_adapter(model, out_dir, train_ds, eval_ds, args, adapter_name, use_kd=False, teacher=None):
     os.makedirs(out_dir, exist_ok=True)
-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n[Pre-train] Trainable params: {trainable:,}")
-
+    print(f"\n[train] {adapter_name}: {trainable:,} trainable params → {out_dir}")
     if trainable == 0:
         raise RuntimeError("No trainable parameters!")
 
-    common = {
-        "output_dir": out_dir,
-        "per_device_train_batch_size": args.bs,
-        "gradient_accumulation_steps": args.grad_acc,
-        "learning_rate": args.lr,
-        "num_train_epochs": args.epochs,
-        "logging_strategy": "steps",
-        "logging_steps": args.logging_steps,
-        "logging_first_step": True,
-        "max_grad_norm": args.max_grad_norm,
-        "warmup_ratio": args.warmup_ratio,
-        "remove_unused_columns": False,
-        "report_to": "none",
-        "save_total_limit": args.save_total_limit,
-    }
-
+    common = dict(
+        output_dir=out_dir, per_device_train_batch_size=args.bs,
+        gradient_accumulation_steps=args.grad_acc, learning_rate=args.lr,
+        num_train_epochs=args.epochs, logging_strategy="steps",
+        logging_steps=args.logging_steps, logging_first_step=True,
+        max_grad_norm=args.max_grad_norm, warmup_ratio=args.warmup_ratio,
+        remove_unused_columns=False, report_to="none",
+        save_total_limit=args.save_total_limit)
     dtype_map = {"bf16": {"bf16": True, "fp16": False}, "fp16": {"fp16": True, "bf16": False}}
-    common.update(dtype_map.get(args.dtype, {"fp16": False, "bf16": False}))
+    common.update(dtype_map.get(args.dtype, {}))
 
     try:
-        targs = TrainingArguments(
-            **common,
+        targs = TrainingArguments(**common,
             eval_strategy="steps" if args.eval_steps > 0 else "no",
             eval_steps=args.eval_steps if args.eval_steps > 0 else None,
             save_strategy="steps" if args.save_steps > 0 else "no",
-            save_steps=args.save_steps if args.save_steps > 0 else None,
-        )
+            save_steps=args.save_steps if args.save_steps > 0 else None)
     except TypeError:
-        targs = TrainingArguments(
-            **common,
+        targs = TrainingArguments(**common,
             evaluation_strategy="steps" if args.eval_steps > 0 else "no",
             eval_steps=args.eval_steps if args.eval_steps > 0 else None,
             save_strategy="steps" if args.save_steps > 0 else "no",
-            save_steps=args.save_steps if args.eval_steps > 0 else None,
-        )
+            save_steps=args.save_steps if args.save_steps > 0 else None)
 
-    trainer_cls = KDTrainer if (use_kd and teacher) else Trainer
-    kwargs = {
-        "model": model,
-        "args": targs,
-        "train_dataset": train_ds,
-        "eval_dataset": eval_ds,
-        "data_collator": default_data_collator,
-    }
+    cls = KDTrainer if (use_kd and teacher) else Trainer
+    kw = dict(model=model, args=targs, train_dataset=train_ds,
+              eval_dataset=eval_ds, data_collator=default_data_collator)
+    if cls is KDTrainer:
+        kw.update(teacher_model=teacher, kd_alpha=args.kd_alpha, temperature=args.kd_T)
 
-    if trainer_cls is KDTrainer:
-        kwargs.update({"teacher_model": teacher, "kd_alpha": args.kd_alpha, "temperature": args.kd_T})
-
-    trainer = trainer_cls(**kwargs)
-    trainer.train()
-
+    cls(**kw).train()
     if isinstance(model, PeftModel):
         try:
             model.save_pretrained(out_dir, selected_adapters=[adapter_name])
@@ -511,31 +520,22 @@ def train_adapter(model, out_dir, train_ds, eval_ds, args, adapter_name, use_kd=
 def load_teacher(args):
     if not args.use_kd:
         return None
-
-    print(f"[Teacher] Loading {args.teacher_model} on {args.teacher_device}")
-
+    print(f"[Teacher] {args.teacher_model} on {args.teacher_device}")
     try:
         if args.teacher_4bit:
             from transformers import BitsAndBytesConfig
             teacher = AutoModelForCausalLM.from_pretrained(
                 args.teacher_model,
                 quantization_config=BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                ),
-                device_map={"": args.teacher_device},
-            )
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16),
+                device_map={"": args.teacher_device})
         else:
             teacher = AutoModelForCausalLM.from_pretrained(
-                args.teacher_model,
-                torch_dtype=torch.bfloat16,
-                device_map={"": args.teacher_device},
-            )
+                args.teacher_model, torch_dtype=torch.bfloat16,
+                device_map={"": args.teacher_device})
     except Exception as e:
-        print(f"[Teacher] Error: {e}")
-        raise
-
+        print(f"[Teacher] Error: {e}"); raise
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
@@ -548,11 +548,12 @@ def load_teacher(args):
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
-
     p.add_argument("--base_dir", required=True)
     p.add_argument("--bundles_dir", required=True)
-    p.add_argument("--stage", type=int, choices=[1, 2], required=True)
+    p.add_argument("--b_merged_dir", default=None, help="Stage 3: B_merged 번들 디렉토리")
+    p.add_argument("--stage", type=int, choices=[1, 2, 3], required=True)
     p.add_argument("--out_adapters", required=True)
+    p.add_argument("--original_num_layers", type=int, default=32)
 
     p.add_argument("--qa_dataset", default="squad")
     p.add_argument("--max_samples", type=int, default=20000)
@@ -578,93 +579,154 @@ def parse_args():
     p.add_argument("--teacher_4bit", action="store_true")
     p.add_argument("--kd_alpha", type=float, default=0.1)
     p.add_argument("--kd_T", type=float, default=2.0)
-
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Tokenizer
+    # ── Tokenizer ──
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
     if not tok.pad_token:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
-    # Student
+    # ── Student 로드 (compact) ──
     print(f"\n[Loading] Student from {args.base_dir}")
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     model = AutoModelForCausalLM.from_pretrained(
-        args.base_dir,
-        torch_dtype=dtype_map[args.dtype],
-        device_map=None,
-        local_files_only=True,
-    )
+        args.base_dir, torch_dtype=dtype_map[args.dtype],
+        device_map=None, local_files_only=True)
 
     device = torch.device(os.environ.get("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.config.use_cache = False
-
     try:
         model.gradient_checkpointing_enable()
         model.enable_input_require_grads()
     except Exception:
         pass
 
-    model = _reapply_passlayers_from_manifest(model, args.base_dir)
+    compact_L = len(_get_layer_container(model))
+    original_N = args.original_num_layers
 
-    # Indices
-    with open(os.path.join(args.base_dir, "prune_log.json")) as f:
-        log = json.load(f)
-    B_idx, C_idx = log["split"]["B"], log["split"]["C"]
+    # ── B/C 인덱스 결정 ──
+    prune_log_path = os.path.join(args.base_dir, "prune_log.json")
+    if os.path.isfile(prune_log_path):
+        with open(prune_log_path) as f:
+            log = json.load(f)
+        B_idx = sorted(log["split"]["B"])
+        C_idx = sorted(log["split"]["C"])
+    else:
+        B_bundle_dir = os.path.join(args.bundles_dir, "B") if args.stage < 3 else args.bundles_dir
+        C_bundle_dir = os.path.join(args.bundles_dir, "C") if args.stage < 3 else args.bundles_dir
+        B_idx = _load_bundle_indices(os.path.join(args.bundles_dir, "B")) if args.stage < 3 else []
+        C_idx = _load_bundle_indices(args.bundles_dir) if args.stage == 3 else _load_bundle_indices(os.path.join(args.bundles_dir, "C"))
 
-    # Datasets
+    removed_all = sorted(set(B_idx + C_idx))
+    A_idx = sorted(set(range(original_N)) - set(removed_all))
+
+    print(f"\n[Index Map] original={original_N}, compact={compact_L}")
+    print(f"  A: {A_idx[:5]}{'...' if len(A_idx) > 5 else ''} ({len(A_idx)}개)")
+    print(f"  B: {B_idx} ({len(B_idx)}개)")
+    print(f"  C: {C_idx} ({len(C_idx)}개)")
+
+    # ── Expand: compact → 원본 크기 (PassLayer) ──
+    print(f"\n[Expand] {compact_L}층 → {original_N}층")
+    model, kept = _expand_to_original_layout(model, removed_all, original_N)
+    layers = _get_layer_container(model)
+
+    # ── Datasets ──
     print("\n[Loading] Datasets")
     train_ds = _load_qa_sft_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len)
     eval_ds = _load_qa_sft_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
 
-    # Teacher
+    # ── Teacher ──
     teacher = load_teacher(args)
 
-    layers = _get_layer_container(model)
-    L = len(layers)
-
+    # ================================================================
+    # Stage 1: A 레이어에만 LoRA (B,C = PassLayer)
+    # ================================================================
     if args.stage == 1:
         print("\n" + "="*60)
-        print("STAGE 1: A-LoRA")
+        print("STAGE 1: A-LoRA (A=real, B+C=PassLayer)")
         print("="*60)
 
-        A_idx = [i for i in range(L) if i not in set(B_idx) | set(C_idx)]
-        print(f"A layers: {A_idx}")
+        # 검증: A 위치가 모두 실제 레이어
+        bad = [i for i in A_idx if not isinstance(layers[i], LlamaDecoderLayer)]
+        if bad:
+            raise RuntimeError(f"A 위치에 비정상 레이어: {bad}")
 
         model = _attach_new_adapter(model, "stageA", r=8, alpha=16, dropout=0.05)
         model.set_adapter("stageA")
         _enable_only_lora_on_indices(model, A_idx, "stageA")
 
-        train_adapter(model, os.path.join(args.out_adapters, "A_lora", "stageA"),
-                      train_ds, eval_ds, args, "stageA", args.use_kd, teacher)
+        out = os.path.join(args.out_adapters, "A_lora", "stageA")
+        train_adapter(model, out, train_ds, eval_ds, args, "stageA", args.use_kd, teacher)
 
+        print(f"\n[Next] Merge: llama_merge_adapter.py --base_model {args.base_dir} "
+              f"--adapter_path {out} --output_dir ./merged_models_llama_7b/A_merged")
+
+    # ================================================================
+    # Stage 2: B 레이어에만 LoRA (A=merged, B=복원, C=PassLayer)
+    # ================================================================
     elif args.stage == 2:
         print("\n" + "="*60)
-        print("STAGE 2: AB-LoRA")
+        print("STAGE 2: B-LoRA (A=merged, B=restored, C=PassLayer)")
         print("="*60)
 
-        AB_idx = [i for i in range(L) if i not in set(C_idx)]
-        print(f"AB layers: {AB_idx}")
+        B_bundle_dir = os.path.join(args.bundles_dir, "B")
+        _assert_bundle_files_exist(B_bundle_dir, B_idx)
+        _rehydrate_layers(model, B_bundle_dir, B_idx)
 
-        _assert_bundle_files_exist(args.bundles_dir, "B", B_idx)
-        _rehydrate_layers(model, os.path.join(args.bundles_dir, "B"), B_idx)
-
-        bad = [i for i in AB_idx if not isinstance(layers[i], LlamaDecoderLayer)]
+        bad = [i for i in B_idx if not isinstance(layers[i], LlamaDecoderLayer)]
         if bad:
-            raise RuntimeError(f"Non-real layers: {bad}")
+            raise RuntimeError(f"B 복원 실패: {bad}")
 
-        model = _attach_new_adapter(model, "stageAB", r=8, alpha=16, dropout=0.05)
-        model.set_adapter("stageAB")
-        _enable_only_lora_on_indices(model, AB_idx, "stageAB")
+        model = _attach_new_adapter(model, "stageB", r=8, alpha=16, dropout=0.05)
+        model.set_adapter("stageB")
+        _enable_only_lora_on_indices(model, B_idx, "stageB")
 
-        train_adapter(model, os.path.join(args.out_adapters, "AB_lora", "stageAB"),
-                      train_ds, eval_ds, args, "stageAB", args.use_kd, teacher)
+        out = os.path.join(args.out_adapters, "B_lora", "stageB")
+        train_adapter(model, out, train_ds, eval_ds, args, "stageB", args.use_kd, teacher)
+
+        print(f"\n[Next] Merge B adapter with B bundle layers")
+
+    # ================================================================
+    # Stage 3: C 레이어에만 LoRA (A=merged, B=merged, C=복원)
+    # ================================================================
+    elif args.stage == 3:
+        print("\n" + "="*60)
+        print("STAGE 3: C-LoRA (A=merged, B=merged, C=restored)")
+        print("="*60)
+
+        if not args.b_merged_dir:
+            raise ValueError("Stage 3 requires --b_merged_dir")
+
+        # B_merged 복원
+        B_merged_indices = _load_bundle_indices(args.b_merged_dir)
+        if not B_merged_indices:
+            B_merged_indices = B_idx
+        _assert_bundle_files_exist(args.b_merged_dir, B_merged_indices)
+        _rehydrate_layers(model, args.b_merged_dir, B_merged_indices)
+
+        # C 복원
+        C_bundle_dir = args.bundles_dir  # Stage 3에서는 bundles_dir이 C 디렉토리
+        _assert_bundle_files_exist(C_bundle_dir, C_idx)
+        _rehydrate_layers(model, C_bundle_dir, C_idx)
+
+        bad = [i for i in C_idx if not isinstance(layers[i], LlamaDecoderLayer)]
+        if bad:
+            raise RuntimeError(f"C 복원 실패: {bad}")
+
+        model = _attach_new_adapter(model, "stageC", r=8, alpha=16, dropout=0.05)
+        model.set_adapter("stageC")
+        _enable_only_lora_on_indices(model, C_idx, "stageC")
+
+        out = os.path.join(args.out_adapters, "C_lora", "stageC")
+        train_adapter(model, out, train_ds, eval_ds, args, "stageC", args.use_kd, teacher)
+
+        print(f"\n[Next] Merge C adapter with C bundle layers")
 
     print("\n[Done] Training completed")
 
