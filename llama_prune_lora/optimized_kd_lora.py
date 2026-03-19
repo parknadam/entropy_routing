@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-LLaMA 구조용 최적화 KD-LoRA 학습 코드 (expand 방식)
+LLaMA 구조용 최적화 KD-LoRA 학습 코드 (sparse/compact 양방향 대응)
 
-핵심:
-  layeronly_drop.py가 물리적으로 제거한 compact 모델(24층)을
-  원본 크기(32층)로 확장한 뒤, 제거된 위치에 PassLayer를 삽입.
-  이후 원본 인덱스 기준으로 LoRA 훈련.
+핵심 수정:
+  drop_consecutive_layers()는 PassLayer로 '교체'하며 삭제하지 않음.
+  save_pretrained()는 config.num_hidden_layers=32를 유지한 채 저장.
+  → from_pretrained() 시 32레이어 생성, dropped 위치는 MISSING(랜덤 초기화).
+  → _ensure_original_layout()이 sparse/compact 양쪽 모두 처리.
 
-Stage 1: A 로드 → 32층 expand → B,C=PassLayer → A 레이어에만 LoRA
-Stage 2: A_merged 로드 → 32층 expand → B 복원 + C=PassLayer → B 레이어에만 LoRA
-Stage 3: A_merged 로드 → 32층 expand → B_merged 복원 + C 복원 → C 레이어에만 LoRA
+Stage 1: A 로드 → 원본 레이아웃 보장 → B,C=PassLayer → A에만 LoRA
+Stage 2: A_merged 로드 → 원본 레이아웃 보장 → B 복원 + C=PassLayer → B에만 LoRA
+Stage 3: A_merged 로드 → 원본 레이아웃 보장 → B_merged+C 복원 → C에만 LoRA
 
 사용법:
 # Stage 1
-CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
-python -m llama_prune_lora.llama_optimized_kd_lora \
+CUDA_VISIBLE_DEVICES=2,5 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_kd_lora \
   --base_dir ./7b_results/pruning/A \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 \
@@ -33,7 +34,7 @@ python -m llama_prune_lora.llama_optimized_kd_lora \
   --stage 2 \
   --out_adapters ./llama_kd_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
+  --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
   --teacher_4bit --teacher_device cuda:1 \
   --kd_alpha 0.1 --kd_T 2.0
@@ -47,14 +48,14 @@ python -m llama_prune_lora.llama_optimized_kd_lora \
   --stage 3 \
   --out_adapters ./llama_kd_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
+  --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model meta-llama/Llama-2-7b-chat-hf \
   --teacher_4bit --teacher_device cuda:1 \
   --kd_alpha 0.1 --kd_T 2.0
 """
 
 import os, json, re, math, inspect
-from typing import List
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,7 +72,6 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 # 레이어 관리
 # ============================================================
 CANON_PATH = "model.layers"
-_LAYER_RE = re.compile(r"\blayers\.(\d+)\.")
 
 
 def _resolve_attr_path(root, dotted: str):
@@ -115,7 +115,6 @@ def _get_layer_container(model):
 
 
 def _invalidate_layer_cache(model):
-    """expand 후 캐시 무효화."""
     for attr in ("_canonical_layers", "_canonical_layers_path"):
         if hasattr(model, attr):
             delattr(model, attr)
@@ -135,16 +134,11 @@ def _decoder_layer_returns_tuple() -> bool:
         sig = inspect.signature(LlamaDecoderLayer.forward)
     except Exception:
         return True
-    if "output_attentions" in sig.parameters:
-        return True
-    ret = sig.return_annotation
-    if ret is inspect.Signature.empty:
-        return True
-    return ret is not torch.Tensor
+    return "output_attentions" in sig.parameters
 
 
 class LlamaPassLayer(nn.Module):
-    def __init__(self, return_tuple: bool):
+    def __init__(self, return_tuple: bool = True):
         super().__init__()
         self.return_tuple = return_tuple
 
@@ -162,41 +156,59 @@ class LlamaPassLayer(nn.Module):
 
 
 # ============================================================
-# Expand: compact(24층) → 원본(32층)
+# 원본 레이아웃 보장 (sparse/compact 양방향 대응)
 # ============================================================
-def _expand_to_original_layout(model, removed_indices, original_num_layers):
+def _ensure_original_layout(model, removed_indices, original_num_layers):
     """
-    compact 모델을 원본 레이어 수로 확장.
-    제거된 위치에 LlamaPassLayer 삽입, 기존 레이어를 원래 인덱스로 재배치.
+    모델을 원본 레이어 수(original_num_layers)로 맞추고,
+    removed 위치에 PassLayer를 설치.
 
-    예: 원본 32, removed=[21..28]
-      compact[0..20] → 원본[0..20], compact[21..23] → 원본[29..31]
-      확장 후: [0..20]=실제A, [21..28]=PassLayer, [29..31]=실제A
+    두 가지 케이스 자동 처리:
+      (a) sparse: from_pretrained가 config대로 32레이어 생성,
+          dropped 위치는 MISSING(랜덤 초기화) → PassLayer로 교체만
+      (b) compact: 물리적으로 축소된 24레이어 모델 →
+          원본 크기로 확장 후 PassLayer 삽입
+
+    Returns: (model, kept_indices)
     """
     layers = _get_layer_container(model)
     current_num = len(layers)
     removed_set = set(int(i) for i in removed_indices)
     kept = sorted(set(range(original_num_layers)) - removed_set)
+    use_tuple = _decoder_layer_returns_tuple()
+    dev = next(model.parameters()).device
 
-    if current_num != len(kept):
+    # ── Case A: sparse (이미 원본 크기) ──
+    if current_num == original_num_layers:
+        print(f"[layout] sparse mode: {current_num}층, "
+              f"installing PassLayer at {sorted(removed_indices)}")
+        for idx in removed_indices:
+            layers[int(idx)] = LlamaPassLayer(return_tuple=use_tuple).to(dev)
+        return model, kept
+
+    # ── Case B: compact (축소된 상태) ──
+    expected_compact = len(kept)
+    if current_num != expected_compact:
         raise ValueError(
             f"레이어 수 불일치: 모델 {current_num}층, "
-            f"예상 {len(kept)}층 (원본 {original_num_layers} - 제거 {len(removed_indices)})"
-        )
+            f"예상 compact={expected_compact} 또는 sparse={original_num_layers}")
+
+    print(f"[layout] compact mode: {current_num}층 → {original_num_layers}층 expand")
 
     current_layers = [layers[i] for i in range(current_num)]
     new_layers = [None] * original_num_layers
 
+    # A 레이어를 원본 위치에 배치
     for pruned_idx, orig_idx in enumerate(kept):
         new_layers[orig_idx] = current_layers[pruned_idx]
 
-    dev = next(model.parameters()).device
-    use_tuple = _decoder_layer_returns_tuple()
+    # removed 위치에 PassLayer
     for idx in removed_indices:
         new_layers[int(idx)] = LlamaPassLayer(return_tuple=use_tuple).to(dev)
 
     assert all(l is not None for l in new_layers), "확장 후 None 레이어 존재"
 
+    # ModuleList 교체
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         model.model.layers = nn.ModuleList(new_layers)
     elif hasattr(model, 'model') and hasattr(model.model, 'model'):
@@ -207,7 +219,6 @@ def _expand_to_original_layout(model, removed_indices, original_num_layers):
     model.config.num_hidden_layers = original_num_layers
     _invalidate_layer_cache(model)
 
-    print(f"[expand] {current_num}층 → {original_num_layers}층")
     print(f"  실제 레이어: {kept[:5]}{'...' if len(kept) > 5 else ''} ({len(kept)}개)")
     print(f"  PassLayer: {sorted(removed_indices)} ({len(removed_indices)}개)")
     return model, kept
@@ -233,7 +244,6 @@ def _pick_layer_file(bundle_dir: str, idx: int) -> str:
 
 
 def _load_bundle_indices(bundle_dir: str) -> list:
-    """bundle_meta.json에서 인덱스 로드, 없으면 파일명에서 추출."""
     meta = os.path.join(bundle_dir, "bundle_meta.json")
     if os.path.isfile(meta):
         with open(meta) as f:
@@ -261,7 +271,7 @@ def _assert_bundle_files_exist(bundle_dir: str, indices: list):
 
 
 def _rehydrate_layers(model, bundle_dir: str, indices: List[int]):
-    """확장된 모델의 원본 인덱스 위치에 번들 레이어 복원."""
+    """원본 인덱스 위치에 번들 레이어 복원 (PassLayer → LlamaDecoderLayer)."""
     layers = _get_layer_container(model)
     dtype = next(model.parameters()).dtype
     device = next(model.parameters()).device
@@ -290,13 +300,17 @@ def _rehydrate_layers(model, bundle_dir: str, indices: List[int]):
 # ============================================================
 # LoRA 어댑터
 # ============================================================
-def _attach_new_adapter(model, name: str, r=8, alpha=16, dropout=0.05):
-    cfg = LoraConfig(
+def _attach_new_adapter(model, name: str, target_layers=None, r=8, alpha=16, dropout=0.05):
+    cfg_kwargs = dict(
         r=r, lora_alpha=alpha, lora_dropout=dropout,
         bias="none", task_type="CAUSAL_LM",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
     )
+    if target_layers is not None:
+        cfg_kwargs["layers_to_transform"] = target_layers
+
+    cfg = LoraConfig(**cfg_kwargs)
     if isinstance(model, PeftModel):
         if name not in getattr(model, "peft_config", {}):
             model.add_adapter(name, cfg)
@@ -304,9 +318,8 @@ def _attach_new_adapter(model, name: str, r=8, alpha=16, dropout=0.05):
         return model
     return get_peft_model(model, cfg, adapter_name=name)
 
-
+    
 def _enable_only_lora_on_indices(model, indices: List[int], adapter_name: str):
-    """특정 레이어의 LoRA 파라미터만 학습 가능하게 설정."""
     for p in model.parameters():
         p.requires_grad = False
 
@@ -443,7 +456,8 @@ class KDTrainer(Trainer):
         mask = (labels_s != -100) & (attn_s == 1)
         tok_n = mask.sum().item()
         if tok_n == 0:
-            return (s_logits_full.sum() * 0.0, s_out) if return_outputs else s_logits_full.sum() * 0.0
+            z = s_logits_full.sum() * 0.0
+            return (z, s_out) if return_outputs else z
 
         s = s_logits[mask].float().clamp(-50, 50)
         t = t_logits[mask].float().clamp(-50, 50)
@@ -472,7 +486,8 @@ class KDTrainer(Trainer):
 # ============================================================
 # 학습 / 티처
 # ============================================================
-def train_adapter(model, out_dir, train_ds, eval_ds, args, adapter_name, use_kd=False, teacher=None):
+def train_adapter(model, out_dir, train_ds, eval_ds, args, adapter_name,
+                  use_kd=False, teacher=None):
     os.makedirs(out_dir, exist_ok=True)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\n[train] {adapter_name}: {trainable:,} trainable params → {out_dir}")
@@ -521,21 +536,18 @@ def load_teacher(args):
     if not args.use_kd:
         return None
     print(f"[Teacher] {args.teacher_model} on {args.teacher_device}")
-    try:
-        if args.teacher_4bit:
-            from transformers import BitsAndBytesConfig
-            teacher = AutoModelForCausalLM.from_pretrained(
-                args.teacher_model,
-                quantization_config=BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.bfloat16),
-                device_map={"": args.teacher_device})
-        else:
-            teacher = AutoModelForCausalLM.from_pretrained(
-                args.teacher_model, torch_dtype=torch.bfloat16,
-                device_map={"": args.teacher_device})
-    except Exception as e:
-        print(f"[Teacher] Error: {e}"); raise
+    if args.teacher_4bit:
+        from transformers import BitsAndBytesConfig
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.teacher_model,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16),
+            device_map={"": args.teacher_device})
+    else:
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.teacher_model, torch_dtype=torch.bfloat16,
+            device_map={"": args.teacher_device})
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
@@ -553,7 +565,8 @@ def parse_args():
     p.add_argument("--b_merged_dir", default=None, help="Stage 3: B_merged 번들 디렉토리")
     p.add_argument("--stage", type=int, choices=[1, 2, 3], required=True)
     p.add_argument("--out_adapters", required=True)
-    p.add_argument("--original_num_layers", type=int, default=32)
+    p.add_argument("--original_num_layers", type=int, default=None,
+                   help="원본 레이어 수 (기본: manifest/prune_log에서 자동 결정)")
 
     p.add_argument("--qa_dataset", default="squad")
     p.add_argument("--max_samples", type=int, default=20000)
@@ -582,6 +595,49 @@ def parse_args():
     return p.parse_args()
 
 
+def _load_index_info(base_dir: str, bundles_dir: str, stage: int,
+                     b_merged_dir: str = None) -> dict:
+    """
+    manifest.json / prune_log.json에서 B/C 인덱스와 원본 레이어 수 결정.
+    Returns: {"B": [...], "C": [...], "L_full": int}
+    """
+    info = {"B": [], "C": [], "L_full": None}
+
+    # manifest.json 우선
+    man_path = os.path.join(base_dir, "manifest.json")
+    if os.path.isfile(man_path):
+        man = json.load(open(man_path))
+        info["L_full"] = man.get("counts", {}).get("L_full")
+        stages = man.get("stages", {})
+        info["B"] = sorted(int(x) for x in stages.get("B", {}).get("removed_layers", []))
+        info["C"] = sorted(int(x) for x in stages.get("C", {}).get("removed_layers", []))
+
+    # prune_log.json fallback
+    log_path = os.path.join(base_dir, "prune_log.json")
+    if os.path.isfile(log_path):
+        log = json.load(open(log_path))
+        if not info["B"]:
+            info["B"] = sorted(log.get("split", {}).get("B", []))
+        if not info["C"]:
+            info["C"] = sorted(log.get("split", {}).get("C", []))
+
+    # bundle_meta.json fallback
+    if not info["B"] and stage < 3:
+        info["B"] = _load_bundle_indices(os.path.join(bundles_dir, "B"))
+    if not info["C"]:
+        c_dir = bundles_dir if stage == 3 else os.path.join(bundles_dir, "C")
+        info["C"] = _load_bundle_indices(c_dir)
+
+    # L_full 추론
+    if not info["L_full"]:
+        all_idx = info["B"] + info["C"]
+        if all_idx:
+            info["L_full"] = max(all_idx) + 1
+            # 연속 블록 제거이므로 마지막 kept 레이어 뒤에 더 있을 수 있음
+            # config에서 읽는 게 더 정확
+    return info
+
+
 def main():
     args = parse_args()
 
@@ -591,7 +647,7 @@ def main():
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
-    # ── Student 로드 (compact) ──
+    # ── Student 로드 ──
     print(f"\n[Loading] Student from {args.base_dir}")
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     model = AutoModelForCausalLM.from_pretrained(
@@ -607,33 +663,27 @@ def main():
     except Exception:
         pass
 
-    compact_L = len(_get_layer_container(model))
-    original_N = args.original_num_layers
+    loaded_L = len(_get_layer_container(model))
 
-    # ── B/C 인덱스 결정 ──
-    prune_log_path = os.path.join(args.base_dir, "prune_log.json")
-    if os.path.isfile(prune_log_path):
-        with open(prune_log_path) as f:
-            log = json.load(f)
-        B_idx = sorted(log["split"]["B"])
-        C_idx = sorted(log["split"]["C"])
-    else:
-        B_bundle_dir = os.path.join(args.bundles_dir, "B") if args.stage < 3 else args.bundles_dir
-        C_bundle_dir = os.path.join(args.bundles_dir, "C") if args.stage < 3 else args.bundles_dir
-        B_idx = _load_bundle_indices(os.path.join(args.bundles_dir, "B")) if args.stage < 3 else []
-        C_idx = _load_bundle_indices(args.bundles_dir) if args.stage == 3 else _load_bundle_indices(os.path.join(args.bundles_dir, "C"))
+    # ── 인덱스 정보 ──
+    info = _load_index_info(args.base_dir, args.bundles_dir, args.stage, args.b_merged_dir)
+    B_idx, C_idx = info["B"], info["C"]
+
+    # original_num_layers 결정: CLI > manifest > config
+    original_N = (args.original_num_layers
+                  or info["L_full"]
+                  or model.config.num_hidden_layers)
 
     removed_all = sorted(set(B_idx + C_idx))
     A_idx = sorted(set(range(original_N)) - set(removed_all))
 
-    print(f"\n[Index Map] original={original_N}, compact={compact_L}")
+    print(f"\n[Index] original={original_N}, loaded={loaded_L}")
     print(f"  A: {A_idx[:5]}{'...' if len(A_idx) > 5 else ''} ({len(A_idx)}개)")
     print(f"  B: {B_idx} ({len(B_idx)}개)")
     print(f"  C: {C_idx} ({len(C_idx)}개)")
 
-    # ── Expand: compact → 원본 크기 (PassLayer) ──
-    print(f"\n[Expand] {compact_L}층 → {original_N}층")
-    model, kept = _expand_to_original_layout(model, removed_all, original_N)
+    # ── 원본 레이아웃 보장 (sparse/compact 자동 대응) ──
+    model, kept = _ensure_original_layout(model, removed_all, original_N)
     layers = _get_layer_container(model)
 
     # ── Datasets ──
@@ -648,16 +698,17 @@ def main():
     # Stage 1: A 레이어에만 LoRA (B,C = PassLayer)
     # ================================================================
     if args.stage == 1:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("STAGE 1: A-LoRA (A=real, B+C=PassLayer)")
-        print("="*60)
+        print("=" * 60)
 
-        # 검증: A 위치가 모두 실제 레이어
         bad = [i for i in A_idx if not isinstance(layers[i], LlamaDecoderLayer)]
         if bad:
             raise RuntimeError(f"A 위치에 비정상 레이어: {bad}")
 
-        model = _attach_new_adapter(model, "stageA", r=8, alpha=16, dropout=0.05)
+        # model = _attach_new_adapter(model, "stageA", r=8, alpha=16, dropout=0.05)
+        model = _attach_new_adapter(model, "stageA", target_layers=A_idx)
+
         model.set_adapter("stageA")
         _enable_only_lora_on_indices(model, A_idx, "stageA")
 
@@ -671,9 +722,9 @@ def main():
     # Stage 2: B 레이어에만 LoRA (A=merged, B=복원, C=PassLayer)
     # ================================================================
     elif args.stage == 2:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("STAGE 2: B-LoRA (A=merged, B=restored, C=PassLayer)")
-        print("="*60)
+        print("=" * 60)
 
         B_bundle_dir = os.path.join(args.bundles_dir, "B")
         _assert_bundle_files_exist(B_bundle_dir, B_idx)
@@ -683,7 +734,8 @@ def main():
         if bad:
             raise RuntimeError(f"B 복원 실패: {bad}")
 
-        model = _attach_new_adapter(model, "stageB", r=8, alpha=16, dropout=0.05)
+        #model = _attach_new_adapter(model, "stageB", r=8, alpha=16, dropout=0.05)
+        model = _attach_new_adapter(model, "stageB", target_layers=B_idx)
         model.set_adapter("stageB")
         _enable_only_lora_on_indices(model, B_idx, "stageB")
 
@@ -696,9 +748,9 @@ def main():
     # Stage 3: C 레이어에만 LoRA (A=merged, B=merged, C=복원)
     # ================================================================
     elif args.stage == 3:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("STAGE 3: C-LoRA (A=merged, B=merged, C=restored)")
-        print("="*60)
+        print("=" * 60)
 
         if not args.b_merged_dir:
             raise ValueError("Stage 3 requires --b_merged_dir")
@@ -711,7 +763,7 @@ def main():
         _rehydrate_layers(model, args.b_merged_dir, B_merged_indices)
 
         # C 복원
-        C_bundle_dir = args.bundles_dir  # Stage 3에서는 bundles_dir이 C 디렉토리
+        C_bundle_dir = args.bundles_dir
         _assert_bundle_files_exist(C_bundle_dir, C_idx)
         _rehydrate_layers(model, C_bundle_dir, C_idx)
 
@@ -719,7 +771,8 @@ def main():
         if bad:
             raise RuntimeError(f"C 복원 실패: {bad}")
 
-        model = _attach_new_adapter(model, "stageC", r=8, alpha=16, dropout=0.05)
+        #model = _attach_new_adapter(model, "stageC", r=8, alpha=16, dropout=0.05)
+        model = _attach_new_adapter(model, "stageC", target_layers=C_idx)
         model.set_adapter("stageC")
         _enable_only_lora_on_indices(model, C_idx, "stageC")
 
