@@ -3,7 +3,7 @@
 # Mistral/LLaMA 모두 지원
 """
 # Mistral 7B 예시
-CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=6 \
 python -m mistral_prune_lora.pruning.layeronly_drop \
   --model mistralai/Mistral-7B-Instruct-v0.1 \
   --device cuda:0 \

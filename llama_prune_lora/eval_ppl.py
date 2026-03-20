@@ -14,7 +14,7 @@ python -m llama_prune_lora.eval_ppl \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --device cuda:0 --dtype bf16 \
-     --lora_A   ./kd_lora_results/adapters/A_lora/stageA/stageA \
+     --lora_A   ./llama_kd_lora_results/adapters/A_lora/stageA/stageA \
      --lora_AB  ./kd_lora_results/adapters/B_lora/stageB/stageB \
      --lora_FULL ./kd_lora_results/adapters/C_lora/stageC/stageC
 

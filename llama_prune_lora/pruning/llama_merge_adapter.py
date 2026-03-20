@@ -10,7 +10,7 @@ Usage:
 # A merge (full model, B/C positions become PassLayer)
 python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/A \
-  --adapter_path ./kd_lora_results/adapters/A_lora/stageA/stageA \
+  --adapter_path ./llama_kd_lora_results/adapters/A_lora/stageA/stageA \
   --output_dir ./merged_models_llama_7b/A_merged \
   --device cuda:0
 

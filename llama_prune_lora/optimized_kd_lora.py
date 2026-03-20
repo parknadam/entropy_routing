@@ -27,8 +27,8 @@ python -m llama_prune_lora.optimized_kd_lora \
   --kd_alpha 0.1 --kd_T 2.0
 
 # Stage 2 (A_merged 기준)
-CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
-python -m llama_prune_lora.llama_optimized_kd_lora \
+CUDA_VISIBLE_DEVICES=2,4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_kd_lora \
   --base_dir ./merged_models_llama_7b/A_merged \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 2 \
@@ -41,7 +41,7 @@ python -m llama_prune_lora.llama_optimized_kd_lora \
 
 # Stage 3 (A_merged + B_merged)
 CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
-python -m llama_prune_lora.llama_optimized_kd_lora \
+python -m llama_prune_lora.optimized_kd_lora \
   --base_dir ./merged_models_llama_7b/A_merged \
   --b_merged_dir ./merged_models_llama_7b/B_merged \
   --bundles_dir ./7b_results/pruning/bundles/C \
