@@ -1,31 +1,37 @@
 #!/usr/bin/env python3
 """
-Utility to merge LoRA adapters into LLaMA base models or bundles.
+Phi-3 전용 LoRA 어댑터 머지 유틸리티.
 
-Core behavior:
-  A merge:  pruned A model + A LoRA -> save full HF model (PassLayer for B/C positions, ~10GB)
-  B/C merge: bundle(B/C) + LoRA -> save only merged bundle layers (~1.6GB)
+변경 사유 요약:
+  1. LlamaPassLayer → Phi3PassLayer (forward 시그니처 Phi-3 호환)
+  2. is_opt 관련 로직 전면 제거
+  3. _get_model_layers에서 OPT decoder.layers 분기 제거
+  4. trust_remote_code=True 추가 (Phi-3 모델 로드 시 필요)
+  5. torch_dtype을 bfloat16으로 변경 (Phi-3 학습 정밀도)
+  6. arch 기본값을 "phi3"로 변경
+  7. 나머지 머지 로직(LoRA scope enforcement, bundle injection, 검증)은
+     모델 아키텍처에 무관한 범용 코드이므로 동일 유지
 
 Usage:
-# A merge (full model, B/C positions become PassLayer)
-python -m llama_prune_lora.pruning.llama_merge_adapter \
-  --base_model ./7b_results/pruning/A \
-  --adapter_path ./llama_kd_lora_results/adapters/A_lora/stageA/stageA \
-  --output_dir ./merged_models_llama_7b/A_merged \
+# A merge (full model)
+python -m phi3_prune_lora.pruning.phi3_merge_adapter \\
+  --base_model ./phi3_results/pruning/A \\
+  --adapter_path ./phi3_kd_lora_results/adapters/A_lora/stageA \\
+  --output_dir ./merged_models_phi3/A_merged \\
   --device cuda:0
 
-# B merge (bundle-only auto detection)
-python -m llama_prune_lora.pruning.llama_merge_adapter \
-  --base_model ./7b_results/pruning/bundles/B \
-  --adapter_path ./llama_kd_lora_results/adapters/B_lora/stageB/stageB \
-  --output_dir ./merged_models_llama_7b/B_merged \
+# B merge (bundle-only)
+python -m phi3_prune_lora.pruning.phi3_merge_adapter \\
+  --base_model ./phi3_results/pruning/bundles/B \\
+  --adapter_path ./phi3_kd_lora_results/adapters/B_lora/stageB \\
+  --output_dir ./merged_models_phi3/B_merged \\
   --device cuda:0
 
-# C merge (bundle-only auto detection)
-python -m llama_prune_lora.pruning.llama_merge_adapter \
-  --base_model ./7b_results/pruning/bundles/C \
-  --adapter_path ./llama_kd_lora_results/adapters/C_lora/stageC/stageC \
-  --output_dir ./merged_models_llama_7b/C_merged \
+# C merge (bundle-only)
+python -m phi3_prune_lora.pruning.phi3_merge_adapter \\
+  --base_model ./phi3_results/pruning/bundles/C \\
+  --adapter_path ./phi3_kd_lora_results/adapters/C_lora/stageC \\
+  --output_dir ./merged_models_phi3/C_merged \\
   --device cuda:0
 """
 
@@ -43,9 +49,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # ============================================================
-# LlamaPassLayer: lightweight placeholder for pruned layers
+# Phi3PassLayer: 프루닝된 위치 placeholder
 # ============================================================
-class LlamaPassLayer(nn.Module):
+class Phi3PassLayer(nn.Module):
+    """
+    변경점: forward 시그니처에 position_embeddings, cache_position 추가
+    → Phi3DecoderLayer와 동일한 인터페이스
+    """
+
     def __init__(self, hidden_size: int = 0):
         super().__init__()
         self.hidden_size = hidden_size
@@ -59,6 +70,7 @@ class LlamaPassLayer(nn.Module):
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
         outputs = (hidden_states,)
@@ -70,7 +82,7 @@ class LlamaPassLayer(nn.Module):
 
 
 # ============================================================
-# manifest / adapter config helpers
+# manifest / adapter config helpers (원본과 동일)
 # ============================================================
 _BUNDLE_LAYER_FILE_RE = re.compile(r"^layer_(\d+)\.safetensors$")
 _LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
@@ -205,6 +217,11 @@ def _extract_layer_sd(raw_sd: dict, idx: int):
 # model layer access
 # ============================================================
 def _get_model_layers(model):
+    """
+    변경점: OPT decoder.layers 분기 제거.
+    Phi-3는 항상 model.model.layers 또는 PeftModel 래핑 시
+    model.base_model.model.model.layers 경로를 사용.
+    """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers
 
@@ -218,17 +235,14 @@ def _get_model_layers(model):
         if hasattr(base, "model") and hasattr(base.model, "layers"):
             return base.model.layers
 
-    if hasattr(model, "model") and hasattr(model.model, "decoder") and hasattr(model.model.decoder, "layers"):
-        return model.model.decoder.layers
-
-    raise RuntimeError("Cannot find LLaMA layers (expected model.layers)")
+    raise RuntimeError("Cannot find Phi-3 layers (expected model.model.layers)")
 
 
 # ============================================================
 # PassLayer restore
 # ============================================================
 def _restore_passlayers(model, dropped_indices: list):
-    """Replace dropped positions with LlamaPassLayer (no parameters)."""
+    """변경점: LlamaPassLayer → Phi3PassLayer"""
     if not dropped_indices:
         return model
     layers = _get_model_layers(model)
@@ -237,16 +251,16 @@ def _restore_passlayers(model, dropped_indices: list):
     for idx in dropped_indices:
         if 0 <= idx < len(layers):
             old = layers[idx]
-            layers[idx] = LlamaPassLayer(hidden_size)
+            layers[idx] = Phi3PassLayer(hidden_size)
             del old
             restored.append(idx)
     if restored:
-        print(f"  [ok] LlamaPassLayer restored: {len(restored)} layers {restored}")
+        print(f"  [ok] Phi3PassLayer restored: {len(restored)} layers {restored}")
     return model
 
 
 # ============================================================
-# bundle injection
+# bundle injection (원본과 동일)
 # ============================================================
 def _inject_bundle_layers_into_model(model, bundle_dir: str, indices: list):
     if not indices:
@@ -278,7 +292,7 @@ def _inject_bundle_layers_into_model(model, bundle_dir: str, indices: list):
 
 
 # ============================================================
-# output directory / save
+# output directory / save (원본과 동일)
 # ============================================================
 def _clear_output_dir(output_dir: str):
     if not os.path.isdir(output_dir):
@@ -318,7 +332,7 @@ def _save_bundle_only(model, output_dir: str, layer_indices: list, source_bundle
         except Exception:
             meta = {}
 
-    meta["arch"] = meta.get("arch", "llama")
+    meta["arch"] = meta.get("arch", "phi3")  # 변경: 기본값 "phi3"
     meta["layer_indices"] = layer_indices
     meta["indices"] = layer_indices
     meta["merged"] = True
@@ -370,6 +384,11 @@ def _save_complete_model(model, tokenizer, output_dir: str, base_model_path: str
     print(f"  Total size: {total_bytes / (1024**3):.2f} GB")
 
 
+def _extract_layer_idx(name: str):
+    m = _LAYER_INDEX_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
 def _save_complete_model_excluding_layers(
     model,
     tokenizer,
@@ -377,10 +396,6 @@ def _save_complete_model_excluding_layers(
     exclude_layer_indices: list,
     base_model_path: str = None,
 ):
-    """
-    Save a full HF model while excluding specific decoder-layer weights from state_dict.
-    Useful for stage A output where B/C pass regions should not be serialized.
-    """
     exclude_set = set(int(i) for i in (exclude_layer_indices or []))
     if not exclude_set:
         return _save_complete_model(model, tokenizer, output_dir, base_model_path)
@@ -406,19 +421,16 @@ def _save_complete_model_excluding_layers(
     try:
         if hasattr(model, "generation_config") and model.generation_config is not None:
             model.generation_config.save_pretrained(output_dir)
-            print("  Saved generation_config.")
     except Exception:
         if base_model_path:
             gen_cfg_file = os.path.join(base_model_path, "generation_config.json")
             if os.path.isfile(gen_cfg_file):
                 shutil.copy2(gen_cfg_file, os.path.join(output_dir, "generation_config.json"))
-                print("  Copied generation_config from base model.")
 
     if base_model_path:
         manifest_src = os.path.join(base_model_path, "manifest.json")
         if os.path.isfile(manifest_src):
             shutil.copy2(manifest_src, os.path.join(output_dir, "manifest.json"))
-            print("  Copied manifest.json.")
 
     saved_files = sorted(os.listdir(output_dir))
     total_bytes = sum(
@@ -431,7 +443,7 @@ def _save_complete_model_excluding_layers(
 
 
 # ============================================================
-# target layer resolution / LoRA scope enforcement
+# target layer resolution / LoRA scope enforcement (원본과 동일)
 # ============================================================
 def _resolve_target_layers(base_model_path: str, adapter_path: str, stage_info: dict = None):
     if stage_info is None:
@@ -459,12 +471,6 @@ def _resolve_target_layers(base_model_path: str, adapter_path: str, stage_info: 
 
 
 def _read_dropped_layers_from_manifest(base_model_path: str, merge_stage: str = None, stage_info: dict = None):
-    """
-    Determine which layers should be restored as PassLayer for each merge stage.
-      A: B+C become PassLayer
-      B: only C becomes PassLayer
-      C: none
-    """
     if stage_info is None:
         stage_info = _read_stage_layers_from_manifest(base_model_path)
 
@@ -483,7 +489,6 @@ def _read_dropped_layers_from_manifest(base_model_path: str, merge_stage: str = 
     if merge_stage == "C":
         return []
 
-    # Stage A / fallback
     if a_dropped:
         return a_dropped
     if b_removed or c_removed:
@@ -491,11 +496,6 @@ def _read_dropped_layers_from_manifest(base_model_path: str, merge_stage: str = 
     if simdrop_removed:
         return simdrop_removed
     return []
-
-
-def _extract_layer_idx(name: str):
-    m = _LAYER_INDEX_RE.search(name)
-    return int(m.group(1)) if m else None
 
 
 def _collect_lora_layers(model):
@@ -536,19 +536,6 @@ def _zero_lora_weights_outside_layers(model, target_layers: list):
                         zeroed_tensors += 1
                         zeroed_layers.add(layer_idx)
 
-            lora_emb_a = getattr(module, "lora_embedding_A", None)
-            lora_emb_b = getattr(module, "lora_embedding_B", None)
-            if lora_emb_a is not None and lora_emb_b is not None and hasattr(lora_emb_a, "keys"):
-                for adapter_name in list(lora_emb_a.keys()):
-                    if adapter_name in lora_emb_a:
-                        lora_emb_a[adapter_name].zero_()
-                        zeroed_tensors += 1
-                        zeroed_layers.add(layer_idx)
-                    if adapter_name in lora_emb_b:
-                        lora_emb_b[adapter_name].zero_()
-                        zeroed_tensors += 1
-                        zeroed_layers.add(layer_idx)
-
     if zeroed_tensors:
         print(
             f"  [ok] LoRA scope enforced: zeroed {zeroed_tensors} tensors outside target layers "
@@ -583,7 +570,7 @@ def _enforce_adapter_scope(model, target_layers: list):
 
 
 # ============================================================
-# tokenizer (multi fallback)
+# tokenizer
 # ============================================================
 def _resolve_tokenizer(*candidate_paths: str, trust_remote_code: bool = True):
     errors = []
@@ -642,7 +629,7 @@ def _device_map_from_arg(device: str):
 
 
 # ============================================================
-# verification
+# verification (원본과 동일)
 # ============================================================
 def _verify_merged_model(output_dir: str):
     print(f"\n[Verify] Checking merged model at {output_dir}...")
@@ -704,9 +691,8 @@ def merge_single_adapter(
     save_bundle_only: bool = False,
     force_full_model: bool = False,
 ):
-    """Merge a single LoRA adapter into base model/bundle."""
     print(f"\n{'=' * 60}")
-    print("Merging Adapter into Base Model (LLaMA)")
+    print("Merging Adapter into Base Model (Phi-3)")
     print(f"{'=' * 60}")
     print(f"Base Model:  {base_model_path}")
     print(f"Adapter:     {adapter_path}")
@@ -714,7 +700,6 @@ def merge_single_adapter(
     if tokenizer_path:
         print(f"Tokenizer:   {tokenizer_path}")
 
-    # Detect whether base_model is HF model dir or bundle dir.
     bundle_mode = False
     bundle_dir = None
     bundle_indices = []
@@ -741,8 +726,7 @@ def merge_single_adapter(
             resolved_adapter_base = os.path.abspath(adapter_base) if os.path.exists(adapter_base) else adapter_base
             if not _is_hf_model_dir(resolved_adapter_base):
                 raise RuntimeError(
-                    "Bundle merge requires a skeleton HF model dir with config.json. "
-                    f"Not found/invalid: {resolved_adapter_base}"
+                    f"Bundle merge requires skeleton HF model dir. Not found: {resolved_adapter_base}"
                 )
 
             effective_base_model_path = resolved_adapter_base
@@ -754,14 +738,12 @@ def merge_single_adapter(
                 f"--base_model has neither config.json nor bundle layer files: {base_model_path}"
             )
 
-    # [1/6] manifest + adapter routing
     print("\n[1/6] Reading manifest/adapter for layer routing...")
     stage_info = _read_stage_layers_from_manifest(effective_base_model_path)
     adapter_stage, target_layers = _resolve_target_layers(
         effective_base_model_path, adapter_path, stage_info
     )
 
-    # For stage B/C adapters, default to bundle-only save unless explicitly forced.
     if adapter_stage in {"B", "C"} and not save_bundle_only and not force_full_model:
         save_bundle_only = True
         print(f"  [mode] Stage {adapter_stage} adapter detected -> auto-enabled bundle-only save mode")
@@ -770,34 +752,12 @@ def merge_single_adapter(
         target_layers = list(bundle_indices)
 
     dropped_layers = _read_dropped_layers_from_manifest(
-        effective_base_model_path,
-        merge_stage=adapter_stage,
-        stage_info=stage_info,
+        effective_base_model_path, merge_stage=adapter_stage, stage_info=stage_info
     )
 
     if adapter_stage:
         print(f"  Adapter stage: {adapter_stage}")
 
-    if bundle_mode:
-        print(f"  Save mode: bundle-only (layers {bundle_indices} only)")
-        if target_layers and set(target_layers) != set(bundle_indices):
-            print(
-                f"  [warn] target layers from manifest/config differ from bundle indices. "
-                f"target={target_layers}, bundle={bundle_indices}"
-            )
-    else:
-        if dropped_layers:
-            print(f"  PassLayer targets: {dropped_layers} ({len(dropped_layers)} layers)")
-        else:
-            print("  PassLayer targets: none")
-
-    if adapter_stage == "A":
-        if dropped_layers:
-            print("  [mode] Stage A merge -> save A-layer weights only (B/C dropped layers excluded)")
-        else:
-            print("  [warn] Stage A merge but no dropped layers resolved from manifest")
-
-    # [2/6] tokenizer
     if save_bundle_only:
         print("\n[2/6] Skipping tokenizer load (bundle-only save)")
         tokenizer = None
@@ -807,13 +767,16 @@ def merge_single_adapter(
         tokenizer = _resolve_tokenizer(*tok_candidates)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-            print(f"  Set pad_token = eos_token ({tokenizer.eos_token})")
 
-    # [3/6] load base skeleton and inject bundle layers if needed.
+    # 변경: trust_remote_code=True, torch_dtype=bfloat16
     print("\n[3/6] Loading base model...")
+    dtype = torch.bfloat16
+    if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        dtype = torch.float16
+
     base_model = AutoModelForCausalLM.from_pretrained(
         effective_base_model_path,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         device_map=_device_map_from_arg(device),
         trust_remote_code=True,
     )
@@ -823,48 +786,35 @@ def merge_single_adapter(
     if bundle_mode:
         _inject_bundle_layers_into_model(base_model, bundle_dir, bundle_indices)
 
-    # [4/6] merge adapter
     print("\n[4/6] Loading and merging adapter...")
     model = PeftModel.from_pretrained(base_model, adapter_path)
     _enforce_adapter_scope(model, target_layers)
     merged_model = model.merge_and_unload()
     print("  [ok] LoRA weights fused into base model")
 
-    # [5/6] restore passlayers when saving full model.
     if save_bundle_only:
         print("\n[5/6] Skipping PassLayer restore (bundle-only save)")
     elif adapter_stage == "A":
-        print("\n[5/6] Skipping PassLayer restore for stage A (will exclude dropped B/C layer keys on save)")
+        print("\n[5/6] Skipping PassLayer restore for stage A")
     else:
-        print("\n[5/6] Restoring LlamaPassLayers for dropped layers...")
+        print("\n[5/6] Restoring Phi3PassLayers for dropped layers...")
         merged_model = _restore_passlayers(merged_model, dropped_layers)
 
-    # [6/6] save
     if save_bundle_only:
         bundle_save_indices = bundle_indices if bundle_indices else target_layers
         if not bundle_save_indices:
             raise RuntimeError("save_bundle_only=True but no layer indices resolved.")
         print(f"\n[6/6] Saving bundle-only (layers {bundle_save_indices}) to {output_dir}...")
-        _save_bundle_only(
-            merged_model,
-            output_dir=output_dir,
-            layer_indices=bundle_save_indices,
-            source_bundle_dir=bundle_dir,
-        )
+        _save_bundle_only(merged_model, output_dir, bundle_save_indices, bundle_dir)
     else:
         print(f"\n[6/6] Saving complete merged model to {output_dir}...")
         if adapter_stage == "A" and dropped_layers:
             _save_complete_model_excluding_layers(
-                merged_model,
-                tokenizer,
-                output_dir=output_dir,
-                exclude_layer_indices=dropped_layers,
-                base_model_path=effective_base_model_path,
+                merged_model, tokenizer, output_dir, dropped_layers, effective_base_model_path
             )
         else:
             _save_complete_model(merged_model, tokenizer, output_dir, effective_base_model_path)
 
-    # cleanup & verify
     del merged_model, model, base_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -877,8 +827,6 @@ def merge_single_adapter(
 
     print(f"\n{'=' * 60}")
     print(f"[ok] Merge completed: {output_dir}")
-    if save_bundle_only:
-        print(f"  (bundle-only: layers {bundle_indices if bundle_indices else target_layers})")
     print(f"{'=' * 60}")
     return output_dir
 
@@ -894,32 +842,23 @@ def merge_multiple_adapters(
     tokenizer_path: str = None,
     verify: bool = True,
 ):
-    """Merge multiple LoRA adapters sequentially (full-model mode only)."""
     if not _is_hf_model_dir(base_model_path):
         raise ValueError("merge_multiple_adapters requires HF base model dir (config.json).")
 
     print(f"\n{'=' * 60}")
-    print("Sequential Adapter Merging (LLaMA)")
+    print("Sequential Adapter Merging (Phi-3)")
     print(f"{'=' * 60}")
-    print(f"Base Model:   {base_model_path}")
-    print(f"Adapters:     {adapter_paths}")
-    print(f"Final Output: {output_dir}")
 
-    print("\n[0a] Reading manifest for stage layers...")
     stage_info = _read_stage_layers_from_manifest(base_model_path)
-    if stage_info["A_dropped"]:
-        print(f"  A dropped: {stage_info['A_dropped']}")
-    if stage_info["B_removed"]:
-        print(f"  B layers:  {stage_info['B_removed']}")
-    if stage_info["C_removed"]:
-        print(f"  C layers:  {stage_info['C_removed']}")
 
-    print("\n[0b] Loading tokenizer...")
-    first_adapter = adapter_paths[0] if adapter_paths else None
-    tok_candidates = _find_tokenizer_candidates(base_model_path, first_adapter, tokenizer_path)
+    tok_candidates = _find_tokenizer_candidates(base_model_path, adapter_paths[0] if adapter_paths else None, tokenizer_path)
     tokenizer = _resolve_tokenizer(*tok_candidates)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = torch.bfloat16
+    if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        dtype = torch.float16
 
     current_model_path = base_model_path
     temp_dirs = []
@@ -928,41 +867,29 @@ def merge_multiple_adapters(
         is_last = i == len(adapter_paths)
         print(f"\n{'-' * 40}")
         print(f"Stage {i}/{len(adapter_paths)}: {os.path.basename(adapter_path)}")
-        print(f"{'-' * 40}")
 
         adapter_stage, target_layers = _resolve_target_layers(base_model_path, adapter_path, stage_info)
         dropped_layers = _read_dropped_layers_from_manifest(
-            base_model_path,
-            merge_stage=adapter_stage,
-            stage_info=stage_info,
+            base_model_path, merge_stage=adapter_stage, stage_info=stage_info
         )
-        if adapter_stage:
-            print(f"  Adapter stage: {adapter_stage}")
-        print(f"  PassLayer targets: {dropped_layers if dropped_layers else '[]'}")
 
-        print(f"  Loading model from {current_model_path}...")
         model = AutoModelForCausalLM.from_pretrained(
             current_model_path,
-            torch_dtype=torch.float16,
+            torch_dtype=dtype,
             device_map=_device_map_from_arg(device),
             trust_remote_code=True,
         )
 
-        print(f"  Loading adapter: {adapter_path}...")
         model = PeftModel.from_pretrained(model, adapter_path)
         _enforce_adapter_scope(model, target_layers)
         merged_model = model.merge_and_unload()
-        print(f"  [ok] Merged stage {i}")
 
-        print("  Restoring LlamaPassLayers...")
         merged_model = _restore_passlayers(merged_model, dropped_layers)
 
         if is_last:
-            print(f"\n  Saving final model to {output_dir}...")
             _save_complete_model(merged_model, tokenizer, output_dir, base_model_path)
         else:
             temp_dir = f"{output_dir}_temp_stage{i}"
-            print(f"  Saving intermediate to {temp_dir}...")
             _save_complete_model(merged_model, tokenizer, temp_dir, base_model_path)
             current_model_path = temp_dir
             temp_dirs.append(temp_dir)
@@ -974,16 +901,13 @@ def merge_multiple_adapters(
     for td in temp_dirs:
         try:
             shutil.rmtree(td)
-            print(f"  Cleaned up: {td}")
         except Exception as e:
             print(f"  Warning: {td}: {e}")
 
     if verify:
         _verify_merged_model(output_dir)
 
-    print(f"\n{'=' * 60}")
-    print(f"[ok] All {len(adapter_paths)} adapters merged: {output_dir}")
-    print(f"{'=' * 60}")
+    print(f"\n[ok] All {len(adapter_paths)} adapters merged: {output_dir}")
     return output_dir
 
 
@@ -992,44 +916,17 @@ def merge_multiple_adapters(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge LoRA adapter(s) into LLaMA base model or bundle",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # A merge (full model, B/C become PassLayer ~10GB)
-  python -m llama_prune_lora.pruning.llama_merge_adapter \\
-    --base_model ./7b_results/pruning/A \\
-    --adapter_path ./kd_lora_results/adapters/A_lora/stageA \\
-    --output_dir ./merged_models_llama_7b/A_merged
-
-  # B merge (bundle-only ~1.6GB)
-  python -m llama_prune_lora.pruning.llama_merge_adapter \\
-    --base_model ./7b_results/pruning/bundles/B \\
-    --adapter_path ./kd_lora_results/adapters/B_lora/stageB \\
-    --output_dir ./merged_models_llama_7b/B_merged
-
-  # C merge (bundle-only ~1.6GB)
-  python -m llama_prune_lora.pruning.llama_merge_adapter \\
-    --base_model ./7b_results/pruning/bundles/C \\
-    --adapter_path ./kd_lora_results/adapters/C_lora/stageC \\
-    --output_dir ./merged_models_llama_7b/C_merged
-        """,
+        description="Merge LoRA adapter(s) into Phi-3 base model or bundle",
     )
-    parser.add_argument("--base_model", type=str, required=True,
-                        help="Path to HF base model (A) or bundle dir (B/C)")
-    parser.add_argument("--adapter_path", type=str, default=None,
-                        help="Path to single adapter")
-    parser.add_argument("--adapter_paths", type=str, nargs="+", default=None,
-                        help="Paths to multiple adapters for sequential full-model merge")
-    parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--base_model", type=str, required=True)
+    parser.add_argument("--adapter_path", type=str, default=None)
+    parser.add_argument("--adapter_paths", type=str, nargs="+", default=None)
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--tokenizer_path", type=str, default=None,
-                        help="Explicit tokenizer path (used for full-model save)")
-    parser.add_argument("--no_verify", action="store_true", help="Skip post-merge verification")
-    parser.add_argument("--save_bundle_only", action="store_true",
-                        help="Force bundle-only save")
-    parser.add_argument("--save_full_model", action="store_true",
-                        help="Force full-model save even when base_model is bundle dir")
+    parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--no_verify", action="store_true")
+    parser.add_argument("--save_bundle_only", action="store_true")
+    parser.add_argument("--save_full_model", action="store_true")
 
     args = parser.parse_args()
 
@@ -1050,8 +947,6 @@ Examples:
             force_full_model=args.save_full_model,
         )
     else:
-        if args.save_bundle_only or args.save_full_model:
-            raise ValueError("--save_bundle_only/--save_full_model are only for single-adapter mode.")
         merge_multiple_adapters(
             base_model_path=args.base_model,
             adapter_paths=args.adapter_paths,

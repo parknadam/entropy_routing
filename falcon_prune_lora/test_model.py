@@ -38,7 +38,7 @@ B_DIR = f"{BASE}/B_merged"
 C_DIR = f"{BASE}/C_merged"
 
 
-PROMPT = "Tell me about Stuttgart."
+PROMPT = "Tell me about Paris."
 MAX_NEW_TOKENS = 128
 
 

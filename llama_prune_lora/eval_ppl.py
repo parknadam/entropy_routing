@@ -15,7 +15,7 @@ python -m llama_prune_lora.eval_ppl \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --device cuda:0 --dtype bf16 \
      --lora_A   ./llama_kd_lora_results/adapters/A_lora/stageA/stageA \
-     --lora_AB  ./kd_lora_results/adapters/B_lora/stageB/stageB \
+     --lora_AB  ./kd_lora_results/adapters/B_lora/stageB/stageB/stageB \
      --lora_FULL ./kd_lora_results/adapters/C_lora/stageC/stageC
 
 #kd_lora 어댑터(vast ai ver)

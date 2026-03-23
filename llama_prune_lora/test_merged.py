@@ -19,13 +19,13 @@ from safetensors.torch import load_file
 # ──────────────────────────────────────────────
 # Paths
 # ──────────────────────────────────────────────
-'''
-BASE = "/home/devewha/K_ProgressiveServe/merged_models_llama2_7b"
+
+BASE = "/home/devewha/entropy_routing/merged_models_llama_7b"
 A_DIR = f"{BASE}/A_merged"
 B_DIR = f"{BASE}/B_merged"
 C_DIR = f"{BASE}/C_merged"
-'''
-PROMPT = "[INST] Tell me about Stuttgart. [/INST]"
+
+PROMPT = "Tell me about Paris."
 MAX_NEW_TOKENS = 128
 
 
@@ -53,7 +53,7 @@ def load_bundle_into_layer(model, bundle_dir, layer_indices, device):
     into the corresponding model layers.
     """
     for idx in layer_indices:
-        sf_path = f"{bundle_dir}/layer_{idx}.safetensors"
+        sf_path = f"{bundle_dir}/layer_{int(idx):03d}.safetensors"
         weights = load_file(sf_path, device=str(device))
 
         layer = model.model.layers[idx]
