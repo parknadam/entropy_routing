@@ -15,7 +15,7 @@ Stage 3: A_merged 로드 → 32층 유지 → B_merged+C 복원 → C에만 LoRA
 
 사용법:
 # Stage 1
-CUDA_VISIBLE_DEVICES=1,6 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_merged_model_kd_lora \
   --base_dir ./falcon_results/pruning/A \
   --bundles_dir ./falcon_results/pruning/bundles \

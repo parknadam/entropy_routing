@@ -206,3 +206,7 @@ mistral_kd_lora_results/
 *.bin
 *.safetensors
 checkpoint-*/
+
+adapters/
+
+modified_falcon_kd_lora_results/

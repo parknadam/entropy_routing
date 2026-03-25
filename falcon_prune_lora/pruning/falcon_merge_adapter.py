@@ -10,7 +10,7 @@ Usage:
 # A merge (full model, B/C positions become PassLayer)
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/A \
-  --adapter_path ./falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
+  --adapter_path ./modified_falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
   --output_dir ./merged_models_falcon/A_merged \
   --device cuda:0
 
