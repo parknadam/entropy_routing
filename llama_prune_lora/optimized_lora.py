@@ -8,24 +8,43 @@ Stage 3: A_merged 로드 → 원본 레이아웃 보장 → B_merged+C 복원 �
 
 Usage:
 # Stage 1
+<<<<<<< HEAD
 DEVICE=cuda:0 python progressive_lora.py \
+=======
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+>>>>>>> ea86042 (수정)
   --base_dir ./7b_results/pruning/A \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 1 --out_adapters ./lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+<<<<<<< HEAD
   --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32
 
 # Stage 2 (A_merged 기준)
 DEVICE=cuda:0 python progressive_lora.py \
   --base_dir ./merged_models/A_merged \
+=======
+  --seq_len 1024 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+
+# Stage 2 (A_merged 기준)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
+>>>>>>> ea86042 (수정)
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 2 --out_adapters ./lora_results/adapters \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 
 # Stage 3 (A_merged + B_merged)
 DEVICE=cuda:0 python progressive_lora.py \
+<<<<<<< HEAD
   --base_dir ./merged_models/A_merged \
   --b_merged_dir ./merged_models/B_merged \
+=======
+  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
+  --b_merged_dir ./new_merged_models_llama_7b_lora/B_merged \
+>>>>>>> ea86042 (수정)
   --bundles_dir ./7b_results/pruning/bundles/C \
   --stage 3 --out_adapters ./lora_results/adapters \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
@@ -346,7 +365,11 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
             save_steps=args.save_steps if args.save_steps>0 else None)
 
     Trainer(model=model, args=ta, train_dataset=train_ds, eval_dataset=eval_ds,
+<<<<<<< HEAD
             data_collator=default_data_collator, tokenizer=tok).train()
+=======
+            data_collator=default_data_collator, processing_class=tok).train()
+>>>>>>> ea86042 (수정)
 
     if isinstance(model, PeftModel):
         try: model.save_pretrained(out_dir, selected_adapters=[adapter_name])

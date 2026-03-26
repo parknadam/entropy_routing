@@ -15,12 +15,16 @@ Stage 3: A_merged 로드 → 32층 유지 → B_merged+C 복원 → C에만 LoRA
 
 사용법:
 # Stage 1
+<<<<<<< HEAD
 CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda:0 \
+=======
+CUDA_VISIBLE_DEVICES=2,3 DEVICE=cuda:0 \
+>>>>>>> ea86042 (수정)
 python -m falcon_prune_lora.falcon_merged_model_kd_lora \
   --base_dir ./falcon_results/pruning/A \
   --bundles_dir ./falcon_results/pruning/bundles \
   --stage 1 \
-  --out_adapters ./modified_falcon_kd_lora_results/adapters \
+  --out_adapters ./new_falcon_kd_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 1024 --lr 3e-4 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model tiiuae/falcon-7b-instruct \
@@ -33,7 +37,7 @@ python -m falcon_prune_lora.falcon_merged_model_kd_lora \
   --base_dir ./merged_models_falcon/A_merged \
   --bundles_dir ./falcon_results/pruning/bundles \
   --stage 2 \
-  --out_adapters ./modified_falcon_kd_lora_results/adapters \
+  --out_adapters ./new_falcon_kd_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model tiiuae/falcon-7b-instruct \
@@ -47,7 +51,7 @@ python -m falcon_prune_lora.falcon_merged_model_kd_lora \
   --b_merged_dir ./merged_models_falcon/B_merged \
   --bundles_dir ./falcon_results/pruning/bundles/C \
   --stage 3 \
-  --out_adapters ./modified_falcon_kd_lora_results/adapters \
+  --out_adapters ./new_falcon_kd_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32 \
   --use_kd --teacher_model tiiuae/falcon-7b-instruct \

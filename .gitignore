@@ -206,7 +206,13 @@ mistral_kd_lora_results/
 *.bin
 *.safetensors
 checkpoint-*/
+<<<<<<< HEAD
 
 adapters/
 
 modified_falcon_kd_lora_results/
+=======
+lora_results/
+new_falcon_kd_lora_results/
+phi3_small_results/
+>>>>>>> ea86042 (수정)

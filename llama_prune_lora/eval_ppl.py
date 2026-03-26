@@ -8,13 +8,14 @@
 # Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
 # lora 어댑터
-python -m llama_prune_lora.eval_ppl \
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m progressiveserve.llama_prune_lora.eval_ppl \
      --base_model ./7b_results/pruning/A \
      --bundles_dir ./7b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --device cuda:0 --dtype bf16 \
-     --lora_A   ./llama_kd_lora_results/adapters/A_lora/stageA/stageA \
+     --lora_A   ./lora_results/adapters/A_lora/stageA/stageA \
      --lora_AB  ./kd_lora_results/adapters/B_lora/stageB/stageB/stageB \
      --lora_FULL ./kd_lora_results/adapters/C_lora/stageC/stageC
 
