@@ -216,3 +216,5 @@ lora_results/
 new_falcon_kd_lora_results/
 phi3_small_results/
 >>>>>>> ea86042 (수정)
+
+eval_results/

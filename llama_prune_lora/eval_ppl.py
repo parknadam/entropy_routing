@@ -7,9 +7,18 @@
 #
 # Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
+#13b
+CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
+python -m llama_prune_lora.eval_ppl \
+     --base_model ./13b_results/pruning/A \
+     --bundles_dir ./13b_results/pruning/bundles \
+     --text_file ./data/wikitext2_test.txt \
+     --seqlen 1024 --batch_size 1 --max_batches 64 \
+     --device cuda:0 --dtype bf16
+
 # lora 어댑터
 CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
-python -m progressiveserve.llama_prune_lora.eval_ppl \
+python -m llama_prune_lora.eval_ppl \
      --base_model ./7b_results/pruning/A \
      --bundles_dir ./7b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
