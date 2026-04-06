@@ -14,10 +14,14 @@
 #        실제로 존재하는지를 기준으로 판단
 #      → Phi3Small처럼 config에 tie_word_embeddings가 명시되지 않은
 #        모델에서도 정확하게 동작
+#   9. rope_scaling 호환성 패치 추가 (Phi-3-medium 지원)
+#      → 최신 transformers에서는 rope_scaling["rope_type"]을 사용하지만
+#        Phi-3-medium의 커스텀 modeling_phi3.py는 rope_scaling["type"]을 참조
+#      → AutoConfig로 먼저 로드 후 양방향 키를 보정하여 KeyError 방지
 # ─────────────────────────────────────────────────────────────
 """
 # Phi-3-mini (3.8B) 25% 프루닝 예시
-python -m phi3_prune_lora.pruning.layeronly_drop \
+python -m phi_prune_lora.pruning.layeronly_drop \
   --model microsoft/Phi-3-mini-4k-instruct \
   --device cuda:0 \
   --drop_frac 0.25 \
@@ -39,6 +43,19 @@ python -m phi_prune_lora.pruning.layeronly_drop \
   --max_batches 32 \
   --save_dir ./new_phi3_small_results/pruning/A \
   --save_removed_dir ./new_phi3_small_results/pruning/bundles
+
+# Phi-3-medium (14B) 25% 프루닝 예시
+CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
+python -m phi_prune_lora.pruning.layeronly_drop \
+  --model microsoft/Phi-3-medium-4k-instruct \
+  --device cuda:0 \
+  --drop_frac 0.25 \
+  --keep_last_layer \
+  --nsamples 64 \
+  --seqlen 2048 \
+  --max_batches 32 \
+  --save_dir ./phi3_medium_results/pruning/A \
+  --save_removed_dir ./phi3_medium_results/pruning/bundles
 """
 
 import argparse
@@ -47,7 +64,7 @@ import os
 
 import torch
 from safetensors import safe_open
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from .bundler import export_two_bundles
 from .data import get_loaders
@@ -67,6 +84,36 @@ def _resolve_embed_device(model, fallback_device: str):
     return torch.device(fallback_device)
 
 
+def _patch_rope_scaling(config):
+    """
+    rope_scaling 호환성 패치.
+    - 최신 transformers는 rope_scaling["rope_type"] = "default"를 넣지만
+      Phi-3-medium의 커스텀 modeling_phi3.py는 "default"를 인식하지 못함
+    - "default"는 스케일링 미적용이므로 rope_scaling을 None으로 제거
+    - 그 외 타입은 양쪽 키("type"/"rope_type")가 모두 존재하도록 보정
+    """
+    if not hasattr(config, "rope_scaling") or config.rope_scaling is None:
+        return config
+
+    rs = config.rope_scaling
+    scaling_type = rs.get("type") or rs.get("rope_type")
+
+    # "default"는 스케일링 미적용 → rope_scaling 자체를 제거
+    if scaling_type == "default":
+        config.rope_scaling = None
+        print('  [fix] rope_scaling: removed (type="default" means no scaling)')
+        return config
+
+    # 그 외 타입: 양방향 키 보정
+    if "type" not in rs and "rope_type" in rs:
+        rs["type"] = rs["rope_type"]
+        print(f'  [fix] rope_scaling: added "type" = "{rs["type"]}"')
+    elif "rope_type" not in rs and "type" in rs:
+        rs["rope_type"] = rs["type"]
+        print(f'  [fix] rope_scaling: added "rope_type" = "{rs["rope_type"]}"')
+
+    return config
+
 def _load_model(model_name: str, seqlen: int, device_str: str):
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
     if tok.pad_token is None:
@@ -78,8 +125,13 @@ def _load_model(model_name: str, seqlen: int, device_str: str):
         dtype = torch.float16
         print("[warn] bfloat16 not supported on this GPU, falling back to float16")
 
+    # ── config 먼저 로드 후 rope_scaling 패치 ──
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    config = _patch_rope_scaling(config)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
+        config=config,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         device_map=None,

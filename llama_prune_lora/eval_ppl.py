@@ -8,19 +8,30 @@
 # Usage (텍스트 파일로 강제 평가; 가장 안정적)
 """
 #13b
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
 python -m llama_prune_lora.eval_ppl \
      --base_model ./13b_results/pruning/A \
      --bundles_dir ./13b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
-     --device cuda:0 --dtype bf16
+     --device cuda:0 --dtype bf16 \
+     --lora_A   ./llama_13b_lora_results/adapters/A_lora/stageA/stageA \
+
+CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
+python -m llama_prune_lora.eval_ppl \
+     --base_model ./llama2-7b-7/pruning/A \
+     --bundles_dir ./llama2-7b-7/pruning/bundles \
+     --text_file ./data/wikitext2_test.txt \
+     --seqlen 1024 --batch_size 1 --max_batches 64 \
+     --device cuda:0 --dtype bf16 \
+     --lora_A   ./llama_13b_lora_results/adapters/A_lora/stageA/stageA \
+
 
 # lora 어댑터
 CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
 python -m llama_prune_lora.eval_ppl \
-     --base_model ./7b_results/pruning/A \
-     --bundles_dir ./7b_results/pruning/bundles \
+     --base_model ./llama2-7b-7/pruning/A \
+     --bundles_dir ./llama2-7b-7/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --device cuda:0 --dtype bf16 \
@@ -49,13 +60,16 @@ python -m prune_lora.eval_ppl \
      --lora_FULL ./adapters/stageFULL
 
 # 13b
-CUDA_VISIBLE_DEVICES=2 \
+CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
 python -m llama_prune_lora.eval_ppl \
-     --base_model ./32_13b_results/pruning/A \
-     --bundles_dir ./32_13b_results/pruning/bundles \
+     --base_model ./13b_results/pruning/A \
+     --bundles_dir ./13b_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 2048 --batch_size 1 --max_batches 64 \
-     --device cuda:0 --dtype bf16 
+     --device cuda:0 --dtype bf16 \
+     --lora_A   ./llama_13b_lora_results/adapters/A_lora/stageA/stageA \
+     --lora_AB  ./llama_13b_lora_results/adapters/B_lora/stageB/stageB \
+     --lora_FULL ./llama_13b_lora_results/adapters/C_lora/stageC/stageC
 
 
 

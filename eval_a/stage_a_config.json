@@ -1,0 +1,47 @@
+{
+  "_comment": "프루닝 비율별 A 단계 비교 — a_dir + a_adapter_dir (미병합) 또는 a_merged_dir (병합) 중 택1",
+
+  "original_model_dir": "./original_llama2-7b",
+  "original_N": 32,
+
+  "variants": [
+    {
+      "name": "7layers_1024",
+      "a_dir": "/home/devewha/entropy_routing/llama2-7b-7/pruning/A",
+      "a_adapter_dir": "2048_lora_results/adapters/A_lora/stageA/stageA",
+      "removed_layers": [23,24,25,26,27,28,29],
+      "original_N": 32,
+      "_note": "7개 레이어 제거 (21.9%) — A + adapter"
+    },
+    {
+      "name": "7layers_2048",
+      "a_dir": "/home/devewha/entropy_routing/2048_llama2-7b-7/pruning/A",
+      "a_adapter_dir": "2048_lora_results/adapters/A_lora/stageA/stageA",
+      "removed_layers": [22,23,24,25,26,27,28],
+      "original_N": 32,
+      "_note": "7개 레이어 제거 (31.3%) — A + adapter"
+    },
+    {
+      "name": "8layers",
+      "a_dir": "/home/devewha/entropy_routing/7b_results/pruning/A",
+      "a_adapter_dir": "./lora_results_13layers/adapters/A_lora/stageA",
+      "removed_layers": [ 21,22,23,24,25,26,27,28],
+      "original_N": 32,
+      "_note": "8개 레이어 제거 (40.6%) — A + adapter"
+    }
+  ],
+
+  "eval": {
+    "seq_len": 2048,
+    "ppl_stride": 512,
+    "zero_shot_tasks": [
+      "arc_easy", "arc_challenge", "hellaswag",
+      "winogrande", "piqa", "boolq", "openbookqa"
+    ],
+    "system_prompt_lengths": [128, 512, 1024],
+    "system_gen_tokens": 128,
+    "system_n_warmup": 3,
+    "system_n_repeat": 10,
+    "batch_size": "auto"
+  }
+}

@@ -7,6 +7,7 @@ Core behavior:
   B/C merge: bundle(B/C) + LoRA -> save only merged bundle layers (~1.6GB)
 
 Usage:
+# 7b
 # A merge (full model, B/C positions become PassLayer)
 CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
 python -m progressiveserve.llama_prune_lora.pruning.llama_merge_adapter \
@@ -27,6 +28,30 @@ python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/bundles/C \
   --adapter_path ./lora_results/adapters/C_lora/stageC/stageC \
   --output_dir ./new_merged_models_llama_7b_lora/C_merged \
+  --device cuda:0
+
+# 13b
+# A merge (full model, B/C positions become PassLayer)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.pruning.llama_merge_adapter \
+  --base_model ./13b_results/pruning/A \
+  --adapter_path ./llama_13b_lora_results/adapters/A_lora/stageA/stageA \
+  --output_dir ./merged_models_llama_13b_lora/A_merged
+
+# B merge (bundle-only auto detection)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.pruning.llama_merge_adapter \
+  --base_model ./13b_results/pruning/bundles/B \
+  --adapter_path ./llama_13b_lora_results/adapters/B_lora/stageB/stageB \
+  --output_dir ./merged_models_llama_13b_lora/B_merged \
+  --device cuda:0
+
+# C merge (bundle-only auto detection)
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m llama_prune_lora.pruning.llama_merge_adapter \
+  --base_model ./13b_results/pruning/bundles/C \
+  --adapter_path ./llama_13b_lora_results/adapters/C_lora/stageC/stageC \
+  --output_dir ./merged_models_llama_13b_lora/C_merged \
   --device cuda:0
 """
 

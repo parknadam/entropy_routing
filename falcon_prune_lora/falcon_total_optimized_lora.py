@@ -1,72 +1,29 @@
 #!/usr/bin/env python3
 """
-Falcon Progressive 3-Stage LoRA Training (skeleton-preserving, no KD)
+Falcon Progressive 2-Stage LoRA Training (skeleton-preserving, no KD)
 
 Stage 1: A 로드 → 원본 레이아웃 보장 → B,C=PassLayer → A에만 LoRA
-Stage 2: A_merged 로드 → 원본 레이아웃 보장 → B 복원 + C=PassLayer → B에만 LoRA
-Stage 3: A_merged 로드 → 원본 레이아웃 보장 → B_merged+C 복원 → C에만 LoRA
+Stage 2: A 로드 → B 복원 + C=PassLayer → A,B 전체에 LoRA
 
 Usage:
-# Stage 1 - 2048
-CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./falcon_results/pruning/A \
-  --bundles_dir ./falcon_results/pruning/bundles \
-  --stage 1 --out_adapters ./2048_falcon_lora_results/adapters \
-  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
-
-# Stage 2 (A_merged 기준)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
-  --bundles_dir ./falcon_results/pruning/bundles \
-  --stage 2 --out_adapters ./2048_falcon_lora_results/adapters \
-  --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
-
-# Stage 3 (A_merged + B_merged)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
-  --b_merged_dir ./merged_models_falcon/B_merged \
-  --bundles_dir ./falcon_results/pruning/bundles/C \
-  --stage 3 --out_adapters ./2048_falcon_lora_results/adapters \
-  --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
-"""
-#!/usr/bin/env python3
-"""
-Falcon Progressive 3-Stage LoRA Training (skeleton-preserving, no KD)
-
-Stage 1: A 로드 → 원본 레이아웃 보장 → B,C=PassLayer → A에만 LoRA
-Stage 2: A_merged 로드 → 원본 레이아웃 보장 → B 복원 + C=PassLayer → B에만 LoRA
-Stage 3: A_merged 로드 → 원본 레이아웃 보장 → B_merged+C 복원 → C에만 LoRA
-
-Usage:
+#7b
 # Stage 1
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
+CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
+python -m falcon_prune_lora.falcon_total_optimized_lora \
   --base_dir ./falcon_results/pruning/A \
   --bundles_dir ./falcon_results/pruning/bundles \
   --stage 1 --out_adapters ./falcon_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 1024 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
 
-# Stage 2 (A_merged 기준)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
+# Stage 2
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m falcon_prune_lora.falcon_total_optimized_lora \
+  --base_dir ./falcon_results/pruning/A \
   --bundles_dir ./falcon_results/pruning/bundles \
   --stage 2 --out_adapters ./falcon_lora_results/adapters \
-  --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
-
-# Stage 3 (A_merged + B_merged)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
-python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
-  --b_merged_dir ./merged_models_falcon/B_merged \
-  --bundles_dir ./falcon_results/pruning/bundles/C \
-  --stage 3 --out_adapters ./falcon_lora_results/adapters \
-  --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 1024 --lr 3e-5 --epochs 2 --bs 1 --grad_acc 32
 """
 
 import os, sys, json, re, argparse
@@ -90,7 +47,6 @@ except Exception:
 # Falcon 레이어 유틸리티
 # ============================================================
 def _get_layers(model):
-    """Falcon 디코더 레이어 컨테이너 반환 (다양한 wrapper 대응)"""
     for path in [
         lambda m: m.transformer.h,
         lambda m: m.base_model.model.transformer.h,
@@ -98,15 +54,12 @@ def _get_layers(model):
     ]:
         try:
             layers = path(model)
-            if hasattr(layers, "__len__"):
-                return layers
-        except (AttributeError, TypeError):
-            continue
+            if hasattr(layers, "__len__"): return layers
+        except (AttributeError, TypeError): continue
     raise AttributeError("Falcon decoder layers not found")
 
 
 def _set_layers(model, new_layers):
-    """Falcon 레이어 컨테이너 교체"""
     if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
         model.transformer.h = nn.ModuleList(new_layers)
     elif hasattr(model, "model") and hasattr(model.model, "transformer"):
@@ -116,7 +69,6 @@ def _set_layers(model, new_layers):
 
 
 def _layer_prefix(model, i):
-    """PeftModel 래핑 여부에 따른 레이어 prefix"""
     if isinstance(model, PeftModel):
         return f"base_model.model.transformer.h.{i}."
     return f"transformer.h.{i}."
@@ -126,7 +78,6 @@ def _layer_prefix(model, i):
 # FalconPassLayer
 # ============================================================
 class FalconPassLayer(nn.Module):
-    """Falcon decoder-compatible identity layer"""
     def __init__(self, hidden_size=0):
         super().__init__()
         self.hidden_size = hidden_size
@@ -134,8 +85,7 @@ class FalconPassLayer(nn.Module):
     def forward(self, hidden_states, alibi=None, attention_mask=None,
                 position_ids=None, layer_past=None, head_mask=None,
                 use_cache=False, output_attentions=False, **kw):
-        if use_cache:
-            return (hidden_states, layer_past)
+        if use_cache: return (hidden_states, layer_past)
         return (hidden_states,)
 
 
@@ -143,7 +93,6 @@ class FalconPassLayer(nn.Module):
 # Layout: compact → original skeleton
 # ============================================================
 def _ensure_original_layout(model, removed_indices, original_N):
-    """모델을 원본 레이어 수로 맞추고 removed 위치에 FalconPassLayer 삽입"""
     layers = _get_layers(model)
     cur_N = len(layers)
     removed = set(int(i) for i in removed_indices)
@@ -163,15 +112,12 @@ def _ensure_original_layout(model, removed_indices, original_N):
     print(f"[layout] compact: {cur_N}L → {original_N}L expand")
     old = [layers[i] for i in range(cur_N)]
     new = [None] * original_N
-    for pi, oi in enumerate(kept):
-        new[oi] = old[pi]
-    for i in removed:
-        new[int(i)] = FalconPassLayer(hs).to(dev)
+    for pi, oi in enumerate(kept): new[oi] = old[pi]
+    for i in removed: new[int(i)] = FalconPassLayer(hs).to(dev)
     assert all(l is not None for l in new)
 
     _set_layers(model, new)
     model.config.num_hidden_layers = original_N
-
     print(f"  real: {kept[:5]}{'...' if len(kept)>5 else ''} ({len(kept)}), "
           f"pass: {sorted(removed)} ({len(removed)})")
     return model, kept
@@ -197,11 +143,9 @@ def _extract_sd(raw, idx):
 def _load_bundle_indices(bdir):
     meta = os.path.join(bdir, "bundle_meta.json")
     if os.path.isfile(meta):
-        with open(meta) as f:
-            return sorted(json.load(f).get("indices", []))
+        with open(meta) as f: return sorted(json.load(f).get("indices", []))
     return sorted(int(re.match(r"layer_(\d+)", fn).group(1))
-                  for fn in os.listdir(bdir)
-                  if re.match(r"layer_\d+\.safetensors", fn))
+                  for fn in os.listdir(bdir) if re.match(r"layer_\d+\.safetensors", fn))
 
 
 def _assert_bundles(bdir, indices):
@@ -210,32 +154,25 @@ def _assert_bundles(bdir, indices):
         try:
             f = _pick_file(bdir, i)
             if os.path.getsize(f) == 0: missing.append(i)
-        except FileNotFoundError:
-            missing.append(i)
-    if missing:
-        raise FileNotFoundError(f"[bundles] missing/empty: {missing} in {bdir}")
+        except FileNotFoundError: missing.append(i)
+    if missing: raise FileNotFoundError(f"[bundles] missing/empty: {missing} in {bdir}")
     print(f"[bundles-ok] {len(indices)} files in {bdir}")
 
 
 def _rehydrate(model, bdir, indices):
-    """FalconPassLayer → FalconDecoderLayer 복원"""
     if FalconDecoderLayer is None:
         raise RuntimeError("FalconDecoderLayer import 실패")
     layers = _get_layers(model)
     dtype, dev = next(model.parameters()).dtype, next(model.parameters()).device
     for i in indices:
         i = int(i)
-        try:
-            nl = FalconDecoderLayer(model.config, layer_idx=i)
-        except TypeError:
-            nl = FalconDecoderLayer(model.config)
+        try: nl = FalconDecoderLayer(model.config, layer_idx=i)
+        except TypeError: nl = FalconDecoderLayer(model.config)
         nl = nl.to(device=dev, dtype=dtype)
         raw = load_file(_pick_file(bdir, i))
         sd = {k: v.to(device=dev, dtype=dtype) for k, v in _extract_sd(raw, i).items()}
-        try:
-            nl.load_state_dict(sd, strict=True)
-        except RuntimeError:
-            nl.load_state_dict(sd, strict=False)
+        try: nl.load_state_dict(sd, strict=True)
+        except RuntimeError: nl.load_state_dict(sd, strict=False)
         layers[i] = nl
         print(f"[rehydrate] layer {i} restored")
 
@@ -244,14 +181,11 @@ def _rehydrate(model, bdir, indices):
 # LoRA 어댑터
 # ============================================================
 def _detect_targets(model):
-    """Falcon 아키텍처 LoRA target_modules 자동 감지"""
     new_arch = getattr(model.config, "new_decoder_architecture", False)
     if new_arch:
-        candidates = ["q_proj", "k_proj", "v_proj", "dense",
-                       "dense_h_to_4h", "dense_4h_to_h"]
+        candidates = ["q_proj", "k_proj", "v_proj", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     else:
-        candidates = ["query_key_value", "dense",
-                       "dense_h_to_4h", "dense_4h_to_h"]
+        candidates = ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
     names = {n for n, _ in model.named_parameters()}
     verified = [t for t in candidates if any(t in n for n in names)]
     if not verified:
@@ -275,29 +209,54 @@ def _attach(model, name, target_layers=None, r=8, alpha=16, dropout=0.05):
 
 
 def _enable_lora_only(model, indices, adapter_name):
-    for p in model.parameters():
-        p.requires_grad = False
+    for p in model.parameters(): p.requires_grad = False
     pats = [_layer_prefix(model, i) for i in indices]
     n_en = 0
     for name, p in model.named_parameters():
         if any(pt in name for pt in pats) and "lora_" in name.lower():
-            p.requires_grad = True
-            n_en += p.numel()
+            p.requires_grad = True; n_en += p.numel()
     if n_en == 0:
         raise RuntimeError(f"No LoRA params on layers {indices} for '{adapter_name}'")
     print(f"[trainable] {adapter_name}: {n_en:,} params on {len(indices)} layers")
 
 
 # ============================================================
-# Dataset
+# Dataset  ★ 변경 1: 설명형 프롬프트 + 답변 보강
 # ============================================================
+
+# ---- [CHANGED] 설명형 시스템/유저 프롬프트 ----
 def _build_msgs(ctx, q, ds_name):
-    sys = "You are a helpful QA assistant."
+    sys = ("You are a knowledgeable assistant. "
+           "Provide a clear and detailed answer based on the given context. "
+           "Explain your reasoning and include relevant details from the context.")
     if ds_name == "squad_v2":
-        sys += " If the answer is not in the context, say 'unanswerable'."
-    return [{"role": "system", "content": sys},
-            {"role": "user", "content":
-             f"Answer the question using the context.\n\nContext:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"}]
+        sys += " If the answer cannot be found in the context, explain why it is unanswerable."
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content":
+         f"Read the following context and answer the question with a detailed explanation.\n\n"
+         f"Context:\n{ctx}\n\nQuestion:\n{q}"},
+    ]
+
+
+# ---- [NEW] SQuAD 단답 → 설명형 답변으로 보강 ----
+def _enrich_answer(ctx, ans, ds_name):
+    """SQuAD의 짧은 span 답변을 context 문장을 활용해 설명형으로 확장"""
+    if not ans or (ds_name == "squad_v2" and ans == "unanswerable"):
+        return ("The answer cannot be determined from the provided context, "
+                "as the relevant information is not explicitly stated.")
+
+    # context에서 답을 포함하는 문장 추출
+    sents = re.split(r'(?<=[.!?])\s+', ctx.strip())
+    relevant = [s.strip() for s in sents if ans.lower() in s.lower()]
+
+    if relevant:
+        support = " ".join(relevant[:2])  # 최대 2문장
+        return (f"Based on the context, {support} "
+                f"Therefore, the answer is {ans}.")
+    else:
+        return (f"According to the provided context, the answer to this question "
+                f"is {ans}.")
 
 
 def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len):
@@ -319,30 +278,28 @@ def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len):
 
     def proc(ex):
         ctx, q = ex.get("context", ""), ex.get("question", "")
-        ans = ex.get("answers", {}).get("text", [""])[0] or \
-              ("unanswerable" if ds_name == "squad_v2" else "")
+        raw_ans = ex.get("answers", {}).get("text", [""])[0] or \
+                  ("unanswerable" if ds_name == "squad_v2" else "")
         msgs = _build_msgs(ctx, q, ds_name)
 
+        # ---- [CHANGED] 단답 → 설명형 답변 ----
+        ans = _enrich_answer(ctx, raw_ans, ds_name)
+
         if has_chat:
-            p_ids = _to_list(tok.apply_chat_template(
-                msgs, tokenize=True, add_generation_prompt=True))
+            p_ids = _to_list(tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=True))
         else:
             s, u = msgs[0]["content"], msgs[1]["content"]
-            p_ids = _to_list(tok(
-                f"System: {s}\nUser: {u}\nAssistant: ",
-                add_special_tokens=True, truncation=True,
-                max_length=seq_len - 64)["input_ids"])
+            p_ids = _to_list(tok(f"System: {s}\nUser: {u}\nAssistant: ",
+                                 add_special_tokens=True, truncation=True,
+                                 max_length=seq_len - 128)["input_ids"])
 
         a_ids = _to_list(tok(" " + ans, add_special_tokens=False)["input_ids"])
         if eos_id: a_ids += [eos_id]
         if not a_ids: return {"__drop__": 1}
 
-        full = p_ids + a_ids
-        plen = len(p_ids)
+        full = p_ids + a_ids; plen = len(p_ids)
         if len(full) > seq_len:
-            cut = len(full) - seq_len
-            full = full[cut:]
-            plen = max(0, plen - cut)
+            cut = len(full) - seq_len; full = full[cut:]; plen = max(0, plen - cut)
         pad_n = seq_len - len(full)
         ids = [pad_id] * pad_n + full
         mask = [0] * pad_n + [1] * len(full)
@@ -354,15 +311,14 @@ def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len):
 
     ds = ds.map(proc, remove_columns=ds.column_names, num_proc=4)
     ds = ds.filter(lambda x: x["__drop__"] == 0)
-    if "__drop__" in ds.column_names:
-        ds = ds.remove_columns("__drop__")
+    if "__drop__" in ds.column_names: ds = ds.remove_columns("__drop__")
     return ds
 
 
 # ============================================================
-# Index info loader
+# Index info loader (2-stage: stage 파라미터 불필요)
 # ============================================================
-def _load_index_info(base_dir, bundles_dir, stage, b_merged_dir=None):
+def _load_index_info(base_dir, bundles_dir):
     info = {"B": [], "C": [], "L_full": None}
     manifest = os.path.join(base_dir, "manifest.json")
     if os.path.isfile(manifest):
@@ -376,57 +332,49 @@ def _load_index_info(base_dir, bundles_dir, stage, b_merged_dir=None):
         log = json.load(open(log_p))
         if not info["B"]: info["B"] = sorted(log.get("split", {}).get("B", []))
         if not info["C"]: info["C"] = sorted(log.get("split", {}).get("C", []))
-    if not info["B"] and stage < 3:
+    if not info["B"]:
         info["B"] = _load_bundle_indices(os.path.join(bundles_dir, "B"))
     if not info["C"]:
-        c_dir = bundles_dir if stage == 3 else os.path.join(bundles_dir, "C")
-        info["C"] = _load_bundle_indices(c_dir)
+        info["C"] = _load_bundle_indices(os.path.join(bundles_dir, "C"))
     return info
 
 
 # ============================================================
 # README 생성
 # ============================================================
-def _write_readme(out_dir, args, adapter_name, start_time):
-    """학습 메타정보를 README.md로 기록"""
-    end_time = datetime.now()
-    cmd = " ".join(sys.argv)
+def _write_readme(out_dir, args, adapter_name, n_train, train_len, eval_len):
+    env_vars = {k: os.environ.get(k, "") for k in ["CUDA_VISIBLE_DEVICES", "DEVICE"] if os.environ.get(k)}
+    env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items())
+    cmd = f"{env_prefix + ' ' if env_prefix else ''}python {' '.join(sys.argv)}"
+
+    lines = [
+        f"# {adapter_name} LoRA Adapter",
+        f"",
+        f"## Command",
+        f"```bash",
+        f"{cmd}",
+        f"```",
+        f"",
+        f"## Training Info",
+        f"- **Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- **Adapter**: {adapter_name}",
+        f"- **Trainable params**: {n_train:,}",
+        f"- **Train samples**: {train_len:,}",
+        f"- **Eval samples**: {eval_len:,}",
+        f"",
+        f"## Hyperparameters",
+        f"| Param | Value |",
+        f"|-------|-------|",
+    ]
+    for k in ["base_dir", "bundles_dir", "stage", "qa_dataset", "seq_len",
+              "lr", "epochs", "bs", "grad_acc", "warmup_ratio", "max_grad_norm"]:
+        lines.append(f"| {k} | `{getattr(args, k, '')}` |")
+    lines.append("")
+
     readme_path = os.path.join(out_dir, "README.md")
-
-    content = f"""# {adapter_name} — LoRA Adapter
-
-## Training Info
-- **Created**: {start_time.strftime('%Y-%m-%d %H:%M:%S')}
-- **Finished**: {end_time.strftime('%Y-%m-%d %H:%M:%S')}
-- **Duration**: {str(end_time - start_time).split('.')[0]}
-
-## Command
-```bash
-{cmd}
-```
-
-## Hyperparameters
-| Param | Value |
-|-------|-------|
-| stage | {args.stage} |
-| lr | {args.lr} |
-| epochs | {args.epochs} |
-| batch_size | {args.bs} |
-| grad_acc | {args.grad_acc} |
-| seq_len | {args.seq_len} |
-| warmup_ratio | {args.warmup_ratio} |
-| max_grad_norm | {args.max_grad_norm} |
-| dataset | {args.qa_dataset} |
-| max_samples | {args.max_samples} |
-
-## Paths
-- base_dir: `{args.base_dir}`
-- bundles_dir: `{args.bundles_dir}`
-- b_merged_dir: `{args.b_merged_dir or 'N/A'}`
-"""
     with open(readme_path, "w") as f:
-        f.write(content)
-    print(f"[readme] saved → {readme_path}")
+        f.write("\n".join(lines))
+    print(f"[readme] {readme_path}")
 
 
 # ============================================================
@@ -438,40 +386,34 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
     print(f"\n[train] {adapter_name}: {n_train:,} trainable → {out_dir}")
     if n_train == 0: raise RuntimeError("No trainable params!")
 
-    start_time = datetime.now()
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     common = dict(
         output_dir=out_dir,
         per_device_train_batch_size=args.bs,
         gradient_accumulation_steps=args.grad_acc,
-        learning_rate=args.lr,
-        num_train_epochs=args.epochs,
+        learning_rate=args.lr, num_train_epochs=args.epochs,
         bf16=use_bf16, fp16=not use_bf16,
         dataloader_num_workers=4, dataloader_pin_memory=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_torch_fused",
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
+        max_grad_norm=args.max_grad_norm, warmup_ratio=args.warmup_ratio,
         logging_steps=args.logging_steps, logging_first_step=True,
-        remove_unused_columns=False,
-        report_to="none",
+        remove_unused_columns=False, report_to="none",
         save_total_limit=args.save_total_limit,
     )
-
-    # ── epoch 단위 저장 + eval ──
-    epoch_save = dict(
-        save_strategy="epoch",
-        eval_strategy="steps" if args.eval_steps > 0 else "no",
-        eval_steps=args.eval_steps if args.eval_steps > 0 else None,
-    )
-
     try:
-        ta = TrainingArguments(**common, **epoch_save)
+        ta = TrainingArguments(**common,
+            eval_strategy="steps" if args.eval_steps > 0 else "no",
+            eval_steps=args.eval_steps if args.eval_steps > 0 else None,
+            save_strategy="steps" if args.save_steps > 0 else "no",
+            save_steps=args.save_steps if args.save_steps > 0 else None)
     except TypeError:
-        # 구버전 transformers: evaluation_strategy
-        epoch_save["evaluation_strategy"] = epoch_save.pop("eval_strategy")
-        ta = TrainingArguments(**common, **epoch_save)
+        ta = TrainingArguments(**common,
+            evaluation_strategy="steps" if args.eval_steps > 0 else "no",
+            eval_steps=args.eval_steps if args.eval_steps > 0 else None,
+            save_strategy="steps" if args.save_steps > 0 else "no",
+            save_steps=args.save_steps if args.save_steps > 0 else None)
 
     Trainer(model=model, args=ta, train_dataset=train_ds, eval_dataset=eval_ds,
             data_collator=default_data_collator, processing_class=tok).train()
@@ -480,8 +422,7 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         try: model.save_pretrained(out_dir, selected_adapters=[adapter_name])
         except TypeError: model.save_pretrained(out_dir)
 
-    # ── README 기록 ──
-    _write_readme(out_dir, args, adapter_name, start_time)
+    _write_readme(out_dir, args, adapter_name, n_train, len(train_ds), len(eval_ds))
 
 
 # ============================================================
@@ -491,8 +432,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--base_dir", required=True)
     p.add_argument("--bundles_dir", required=True)
-    p.add_argument("--b_merged_dir", default=None)
-    p.add_argument("--stage", type=int, choices=[1, 2, 3], required=True)
+    p.add_argument("--stage", type=int, choices=[1, 2], required=True)
     p.add_argument("--out_adapters", required=True)
     p.add_argument("--original_num_layers", type=int, default=None)
 
@@ -524,27 +464,24 @@ def main():
     tok.padding_side = "left"
 
     # Model
-    device = torch.device(
-        os.environ.get("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if (torch.cuda.is_available()
-                               and torch.cuda.is_bf16_supported()) else torch.float16
+    device = torch.device(os.environ.get("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         args.base_dir, torch_dtype=dtype, device_map=None, local_files_only=True)
     model.to(device)
     model.config.use_cache = False
-    try:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+    try: model.gradient_checkpointing_enable(); model.enable_input_require_grads()
     except: pass
 
     loaded_L = len(_get_layers(model))
 
     # Index info
-    info = _load_index_info(args.base_dir, args.bundles_dir, args.stage, args.b_merged_dir)
+    info = _load_index_info(args.base_dir, args.bundles_dir)
     B_idx, C_idx = info["B"], info["C"]
     original_N = args.original_num_layers or info["L_full"] or model.config.num_hidden_layers
     removed_all = sorted(set(B_idx + C_idx))
     A_idx = sorted(set(range(original_N)) - set(removed_all))
+    AB_idx = sorted(A_idx + B_idx)
 
     print(f"\n[Index] original={original_N}, loaded={loaded_L}")
     print(f"  A({len(A_idx)}): {A_idx[:5]}{'...' if len(A_idx)>5 else ''}")
@@ -554,23 +491,29 @@ def main():
     # Ensure original layout
     model, kept = _ensure_original_layout(model, removed_all, original_N)
     layers = _get_layers(model)
+    del kept
 
     # Datasets
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train",
-                                args.max_samples, args.seq_len)
-    eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation",
-                               args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len)
+    eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
     # ================================================================
-    # Stage 1: A만 LoRA
+    # Stage 1: A만 LoRA (B,C = PassLayer)
     # ================================================================
     if args.stage == 1:
-        print(f"\n{'='*60}\nSTAGE 1: A-LoRA (A=real, B+C=PassLayer)\n{'='*60}")
+        print(f"\n{'='*60}\nSTAGE 1: A-LoRA (A=real, B+C=FalconPassLayer)\n{'='*60}")
+
         if FalconDecoderLayer:
-            bad = [i for i in A_idx if not isinstance(layers[i], FalconDecoderLayer)]
-            if bad: raise RuntimeError(f"A 위치 비정상: {bad}")
+            bad_a = [i for i in A_idx if not isinstance(layers[i], FalconDecoderLayer)]
+            if bad_a: raise RuntimeError(f"A 위치 비정상: {bad_a}")
+        bad_bc = [i for i in (B_idx + C_idx) if not isinstance(layers[i], FalconPassLayer)]
+        if bad_bc: raise RuntimeError(f"B+C가 PassLayer가 아님: {bad_bc}")
+
+        print(f"\n[Layer Verify] 총 {original_N}층")
+        print(f"  A (FalconDecoderLayer): {len(A_idx)}개 ✓")
+        print(f"  B+C (FalconPassLayer):  {len(B_idx)+len(C_idx)}개 ✓")
 
         model = _attach(model, "stageA", target_layers=A_idx)
         model.set_adapter("stageA")
@@ -578,59 +521,37 @@ def main():
 
         out = os.path.join(args.out_adapters, "A_lora", "stageA")
         train_adapter(model, tok, out, train_ds, eval_ds, args, "stageA")
-        print(f"\n[Next] Merge: merge_adapter.py --base_model {args.base_dir} "
-              f"--adapter_path {out} --output_dir ./merged_models_falcon/A_merged")
+        print("\n[Next] Stage 2 can reuse the same --base_dir and restore only B from bundles.")
 
     # ================================================================
-    # Stage 2: B만 LoRA
+    # Stage 2: A+B에 LoRA (A=real, B=복원, C=PassLayer)
     # ================================================================
     elif args.stage == 2:
-        print(f"\n{'='*60}\nSTAGE 2: B-LoRA (A=merged, B=restored, C=PassLayer)\n{'='*60}")
+        print(f"\n{'='*60}\nSTAGE 2: AB-LoRA (A=real, B=restored, C=FalconPassLayer)\n{'='*60}")
+
         B_bdir = os.path.join(args.bundles_dir, "B")
         _assert_bundles(B_bdir, B_idx)
         _rehydrate(model, B_bdir, B_idx)
 
         if FalconDecoderLayer:
-            bad = [i for i in B_idx if not isinstance(layers[i], FalconDecoderLayer)]
-            if bad: raise RuntimeError(f"B 복원 실패: {bad}")
+            bad_a = [i for i in A_idx if not isinstance(layers[i], FalconDecoderLayer)]
+            if bad_a: raise RuntimeError(f"A 위치 비정상: {bad_a}")
+            bad_b = [i for i in B_idx if not isinstance(layers[i], FalconDecoderLayer)]
+            if bad_b: raise RuntimeError(f"B 복원 실패: {bad_b}")
+        bad_c = [i for i in C_idx if not isinstance(layers[i], FalconPassLayer)]
+        if bad_c: raise RuntimeError(f"C가 PassLayer가 아님: {bad_c}")
 
-        model = _attach(model, "stageB", target_layers=B_idx)
-        model.set_adapter("stageB")
-        _enable_lora_only(model, B_idx, "stageB")
+        print(f"\n[Layer Verify] 총 {original_N}층")
+        print(f"  A (FalconDecoderLayer): {A_idx[:5]}{'...' if len(A_idx)>5 else ''} ({len(A_idx)}개) ✓")
+        print(f"  B (FalconDecoderLayer): {B_idx} ({len(B_idx)}개) ✓")
+        print(f"  C (FalconPassLayer):    {C_idx} ({len(C_idx)}개) ✓")
 
-        out = os.path.join(args.out_adapters, "B_lora", "stageB")
-        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageB")
-        print(f"\n[Next] Merge B adapter with B bundle → B_merged")
+        model = _attach(model, "stageAB", target_layers=AB_idx)
+        model.set_adapter("stageAB")
+        _enable_lora_only(model, AB_idx, "stageAB")
 
-    # ================================================================
-    # Stage 3: C만 LoRA
-    # ================================================================
-    elif args.stage == 3:
-        print(f"\n{'='*60}\nSTAGE 3: C-LoRA (A=merged, B=merged, C=restored)\n{'='*60}")
-        if not args.b_merged_dir:
-            raise ValueError("Stage 3 requires --b_merged_dir")
-
-        # B_merged 복원
-        bm_indices = _load_bundle_indices(args.b_merged_dir) or B_idx
-        _assert_bundles(args.b_merged_dir, bm_indices)
-        _rehydrate(model, args.b_merged_dir, bm_indices)
-
-        # C 복원
-        C_bdir = args.bundles_dir
-        _assert_bundles(C_bdir, C_idx)
-        _rehydrate(model, C_bdir, C_idx)
-
-        if FalconDecoderLayer:
-            bad = [i for i in C_idx if not isinstance(layers[i], FalconDecoderLayer)]
-            if bad: raise RuntimeError(f"C 복원 실패: {bad}")
-
-        model = _attach(model, "stageC", target_layers=C_idx)
-        model.set_adapter("stageC")
-        _enable_lora_only(model, C_idx, "stageC")
-
-        out = os.path.join(args.out_adapters, "C_lora", "stageC")
-        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageC")
-        print(f"\n[Next] Merge C adapter with C bundle → C_merged")
+        out = os.path.join(args.out_adapters, "AB_lora", "stageAB")
+        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageAB")
 
     print("\n[Done] Training completed")
 

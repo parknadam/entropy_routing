@@ -18,17 +18,7 @@ python -m llama_prune_lora.total_optimized_lora \
   --seq_len 2048 --lr 3e-4 --epochs 4 --bs 1 --grad_acc 32
 
 # Stage 2 (A + B LoRA)
-#공격적인 ver
 CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
-python -m llama_prune_lora.total_optimized_lora \
-  --base_dir ./13b_results/pruning/A \
-  --bundles_dir ./13b_results/pruning/bundles \
-  --stage 2 --out_adapters ./llama_13b_lora_results/adapters \
-  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 2048 --lr 1e-4 --epochs 2 --bs 1 --grad_acc 32
-
-#좀 더 무난한 ver
-CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
 python -m llama_prune_lora.total_optimized_lora \
   --base_dir ./13b_results/pruning/A \
   --bundles_dir ./13b_results/pruning/bundles \
@@ -412,6 +402,18 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         raise RuntimeError("No trainable params!")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+    # --- 마지막 체크포인트 자동 탐지 ---
+    last_ckpt = None
+    if os.path.isdir(out_dir):
+        ckpts = sorted(
+            [d for d in os.listdir(out_dir) if d.startswith("checkpoint-")],
+            key=lambda x: int(x.split("-")[-1]),
+        )
+        if ckpts:
+            last_ckpt = os.path.join(out_dir, ckpts[-1])
+            print(f"[resume] found checkpoint: {last_ckpt}")
+
     common = dict(
         output_dir=out_dir,
         per_device_train_batch_size=args.bs,
@@ -432,22 +434,17 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         remove_unused_columns=False,
         report_to="none",
         save_total_limit=args.save_total_limit,
+        save_strategy="epoch",                # ← 매 epoch마다 저장
     )
     try:
         ta = TrainingArguments(
             **common,
-            eval_strategy="steps" if args.eval_steps > 0 else "no",
-            eval_steps=args.eval_steps if args.eval_steps > 0 else None,
-            save_strategy="steps" if args.save_steps > 0 else "no",
-            save_steps=args.save_steps if args.save_steps > 0 else None,
+            eval_strategy="epoch" if args.eval_steps > 0 else "no",
         )
     except TypeError:
         ta = TrainingArguments(
             **common,
-            evaluation_strategy="steps" if args.eval_steps > 0 else "no",
-            eval_steps=args.eval_steps if args.eval_steps > 0 else None,
-            save_strategy="steps" if args.save_steps > 0 else "no",
-            save_steps=args.save_steps if args.save_steps > 0 else None,
+            evaluation_strategy="epoch" if args.eval_steps > 0 else "no",
         )
 
     Trainer(
@@ -457,14 +454,13 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         eval_dataset=eval_ds,
         data_collator=default_data_collator,
         processing_class=tok,
-    ).train()
+    ).train(resume_from_checkpoint=last_ckpt)   # ← 자동 재개
 
     if isinstance(model, PeftModel):
         try:
             model.save_pretrained(out_dir, selected_adapters=[adapter_name])
         except TypeError:
             model.save_pretrained(out_dir)
-
 
 # ============================================================
 # Main

@@ -18,7 +18,61 @@ python -m llama_prune_lora.optimized_lora \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
   --seq_len 2048 --lr 3e-4 --epochs 4 --bs 1 --grad_acc 32
 
+# Stage 2 (A_merged 기준)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./merged_models_llama_13b_lora/A_merged \
+  --bundles_dir ./13b_results/pruning/bundles \
+  --stage 2 --out_adapters ./llama_13b_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 2048 --lr 3e-5 --epochs 2 --bs 1 --grad_acc 32
 
+# Stage 3 (A_merged + B_merged)
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./merged_models_llama_13b_lora/A_merged \
+  --b_merged_dir ./merged_models_llama_13b_lora/B_merged \
+  --bundles_dir ./13b_results/pruning/bundles/C \
+  --stage 3 --out_adapters ./llama_13b_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 2048 --lr 3e-5 --epochs 2 --bs 1 --grad_acc 32
+
+# 7b - 7개 프루닝 실험
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./llama2-7b-7/pruning/A \
+  --bundles_dir ./llama2-7b-7/pruning/bundles \
+  --stage 1 --out_adapters ./7_llama2_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 1024 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+
+# 7b 실험 -2048
+# Stage 1
+CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./7b_results/pruning/A \
+  --bundles_dir ./7b_results/pruning/bundles \
+  --stage 1 --out_adapters ./2048_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+
+# Stage 2 (A_merged 기준)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
+  --bundles_dir ./7b_results/pruning/bundles \
+  --stage 2 --out_adapters ./2048_lora_results/adapters \
+  --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
+
+# Stage 3 (A_merged + B_merged)
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
+  --b_merged_dir ./new_merged_models_llama_7b_lora/B_merged \
+  --bundles_dir ./7b_results/pruning/bundles/C \
+  --stage 3 --out_adapters ./2048_lora_results/adapters \
+  --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
+"
 # 7b 실험
 # Stage 1
 CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
@@ -47,17 +101,85 @@ python -m llama_prune_lora.optimized_lora \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 """
 
-import os, json, re, inspect, argparse
+import os, sys, json, re, inspect, argparse, time
+from datetime import datetime, timezone, timedelta
 from typing import List
 import torch, torch.nn as nn
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
-    Trainer, TrainingArguments, default_data_collator,
+    Trainer, TrainingArguments, TrainerCallback, default_data_collator,
 )
 from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+KST = timezone(timedelta(hours=9))
+
+# ============================================================
+# Per-epoch save callback
+# ============================================================
+class EpochSaveCallback(TrainerCallback):
+    """매 epoch 종료 시 adapter를 epoch_N/ 폴더에 저장"""
+    def __init__(self, out_dir, adapter_name):
+        self.out_dir = out_dir
+        self.adapter_name = adapter_name
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        epoch_n = int(state.epoch)
+        save_path = os.path.join(self.out_dir, f"epoch_{epoch_n}")
+        os.makedirs(save_path, exist_ok=True)
+        if isinstance(model, PeftModel):
+            try: model.save_pretrained(save_path, selected_adapters=[self.adapter_name])
+            except TypeError: model.save_pretrained(save_path)
+        # 메트릭 저장
+        metrics = {"epoch": epoch_n, "global_step": state.global_step}
+        recent = [l for l in (state.log_history or []) if "loss" in l]
+        if recent: metrics["last_train_loss"] = recent[-1]["loss"]
+        evals = [l for l in (state.log_history or []) if "eval_loss" in l]
+        if evals: metrics["last_eval_loss"] = evals[-1]["eval_loss"]
+        with open(os.path.join(save_path, "epoch_metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"[checkpoint] epoch {epoch_n} saved → {save_path}")
+
+# ============================================================
+# README logger
+# ============================================================
+def _write_readme(out_dir, start_time, end_time=None, args=None, extra=None):
+    """README.md에 실행 정보 append"""
+    os.makedirs(out_dir, exist_ok=True)
+    readme = os.path.join(out_dir, "README.md")
+
+    cmd = " ".join(sys.argv)
+    elapsed = ""
+    if end_time and start_time:
+        dt = end_time - start_time
+        h, rem = divmod(int(dt), 3600)
+        m, s = divmod(rem, 60)
+        elapsed = f"{h}h {m}m {s}s"
+
+    lines = []
+    if not os.path.isfile(readme):
+        lines.append("# LoRA Training Log\n")
+
+    lines.append(f"\n## Run @ {datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S KST')}\n")
+    lines.append(f"- **Command**: `{cmd}`")
+    lines.append(f"- **Start**: {datetime.fromtimestamp(start_time, KST).strftime('%Y-%m-%d %H:%M:%S KST')}")
+    if end_time:
+        lines.append(f"- **End**: {datetime.fromtimestamp(end_time, KST).strftime('%Y-%m-%d %H:%M:%S KST')}")
+        lines.append(f"- **Elapsed**: {elapsed}")
+    if args:
+        lines.append(f"- **Stage**: {args.stage}")
+        lines.append(f"- **LR**: {args.lr}, **Epochs**: {args.epochs}, **BS**: {args.bs}×{args.grad_acc}")
+        lines.append(f"- **Seq len**: {args.seq_len}, **Dataset**: {args.qa_dataset}")
+    if extra:
+        for k, v in extra.items():
+            lines.append(f"- **{k}**: {v}")
+    lines.append("")
+
+    with open(readme, "a") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[readme] logged → {readme}")
 
 # ============================================================
 # Layer utilities
@@ -94,7 +216,7 @@ def _layers(model):
     return model._cl
 
 def _invalidate(model):
-    for a in ("_cl", "_clp"): 
+    for a in ("_cl", "_clp"):
         if hasattr(model, a): delattr(model, a)
 
 def _prefix(model, i):
@@ -125,8 +247,6 @@ class PassLayer(nn.Module):
 # Layout: sparse/compact → original skeleton
 # ============================================================
 def _ensure_original_layout(model, removed_indices, original_N):
-    """모델을 원본 레이어 수로 맞추고 removed 위치에 PassLayer 설치.
-    sparse(이미 full size)와 compact(축소됨) 양쪽 대응."""
     layers = _layers(model)
     cur_N = len(layers)
     removed = set(int(i) for i in removed_indices)
@@ -134,14 +254,12 @@ def _ensure_original_layout(model, removed_indices, original_N):
     use_t = _returns_tuple()
     dev = next(model.parameters()).device
 
-    # sparse: 이미 원본 크기
     if cur_N == original_N:
         print(f"[layout] sparse: {cur_N}L, PassLayer at {sorted(removed_indices)}")
         for i in removed_indices:
             layers[int(i)] = PassLayer(use_t).to(dev)
         return model, kept
 
-    # compact: 축소된 상태 → 확장
     if cur_N != len(kept):
         raise ValueError(f"layer mismatch: {cur_N} vs expected compact={len(kept)} or sparse={original_N}")
 
@@ -152,7 +270,6 @@ def _ensure_original_layout(model, removed_indices, original_N):
     for i in removed_indices: new[int(i)] = PassLayer(use_t).to(dev)
     assert all(l is not None for l in new)
 
-    # ModuleList 교체
     if hasattr(model, 'model') and hasattr(model.model, 'layers'):
         model.model.layers = nn.ModuleList(new)
     elif hasattr(model, 'model') and hasattr(model.model, 'model'):
@@ -197,7 +314,6 @@ def _assert_bundles(bdir, indices):
     print(f"[bundles-ok] {len(indices)} files in {bdir}")
 
 def _rehydrate(model, bdir, indices):
-    """PassLayer → LlamaDecoderLayer 복원"""
     layers = _layers(model)
     dtype, dev = next(model.parameters()).dtype, next(model.parameters()).device
     for i in indices:
@@ -321,7 +437,7 @@ def _load_index_info(base_dir, bundles_dir, stage, b_merged_dir=None):
     return info
 
 # ============================================================
-# Training
+# Training (modified: epoch callback + README)
 # ============================================================
 def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
     os.makedirs(out_dir, exist_ok=True)
@@ -330,6 +446,8 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
     if n_train == 0: raise RuntimeError("No trainable params!")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+
+    # save_strategy를 epoch으로 변경 (매 epoch 저장)
     common = dict(
         output_dir=out_dir,
         per_device_train_batch_size=args.bs,
@@ -361,12 +479,21 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
             save_strategy="steps" if args.save_steps>0 else "no",
             save_steps=args.save_steps if args.save_steps>0 else None)
 
-    Trainer(model=model, args=ta, train_dataset=train_ds, eval_dataset=eval_ds,
-            data_collator=default_data_collator, processing_class=tok).train()
+    # epoch별 저장 callback 추가
+    epoch_cb = EpochSaveCallback(out_dir, adapter_name)
 
+    t0 = time.time()
+    Trainer(model=model, args=ta, train_dataset=train_ds, eval_dataset=eval_ds,
+            data_collator=default_data_collator, processing_class=tok,
+            callbacks=[epoch_cb]).train()
+    train_elapsed = time.time() - t0
+
+    # 최종 adapter 저장
     if isinstance(model, PeftModel):
         try: model.save_pretrained(out_dir, selected_adapters=[adapter_name])
         except TypeError: model.save_pretrained(out_dir)
+
+    return train_elapsed
 
 # ============================================================
 # Main
@@ -401,6 +528,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    t_start = time.time()
 
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
@@ -441,12 +569,14 @@ def main():
     eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
+    readme_extra = {"A_layers": len(A_idx), "B_layers": len(B_idx), "C_layers": len(C_idx),
+                    "original_N": original_N, "loaded_L": loaded_L}
+
     # ================================================================
-    # Stage 1: A만 LoRA (B,C = PassLayer)
+    # Stage 1
     # ================================================================
     if args.stage == 1:
         print(f"\n{'='*60}\nSTAGE 1: A-LoRA (A=real, B+C=PassLayer)\n{'='*60}")
-
         bad = [i for i in A_idx if not isinstance(layers[i], LlamaDecoderLayer)]
         if bad: raise RuntimeError(f"A 위치 비정상: {bad}")
 
@@ -455,17 +585,18 @@ def main():
         _enable_lora_only(model, A_idx, "stageA")
 
         out = os.path.join(args.out_adapters, "A_lora", "stageA")
-        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageA")
+        train_elapsed = train_adapter(model, tok, out, train_ds, eval_ds, args, "stageA")
+        readme_extra["train_time"] = f"{train_elapsed/60:.1f} min"
 
+        _write_readme(out, t_start, time.time(), args, readme_extra)
         print(f"\n[Next] Merge: merge_adapter.py --base_model {args.base_dir} "
               f"--adapter_path {out} --output_dir ./merged_models/A_merged")
 
     # ================================================================
-    # Stage 2: B만 LoRA (A=merged, B=복원, C=PassLayer)
+    # Stage 2
     # ================================================================
     elif args.stage == 2:
         print(f"\n{'='*60}\nSTAGE 2: B-LoRA (A=merged, B=restored, C=PassLayer)\n{'='*60}")
-
         B_bdir = os.path.join(args.bundles_dir, "B")
         _assert_bundles(B_bdir, B_idx)
         _rehydrate(model, B_bdir, B_idx)
@@ -478,25 +609,24 @@ def main():
         _enable_lora_only(model, B_idx, "stageB")
 
         out = os.path.join(args.out_adapters, "B_lora", "stageB")
-        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageB")
+        train_elapsed = train_adapter(model, tok, out, train_ds, eval_ds, args, "stageB")
+        readme_extra["train_time"] = f"{train_elapsed/60:.1f} min"
 
+        _write_readme(out, t_start, time.time(), args, readme_extra)
         print(f"\n[Next] Merge B adapter with B bundle → B_merged")
 
     # ================================================================
-    # Stage 3: C만 LoRA (A=merged, B=merged, C=복원)
+    # Stage 3
     # ================================================================
     elif args.stage == 3:
         print(f"\n{'='*60}\nSTAGE 3: C-LoRA (A=merged, B=merged, C=restored)\n{'='*60}")
-
         if not args.b_merged_dir:
             raise ValueError("Stage 3 requires --b_merged_dir")
 
-        # B_merged 복원
         bm_indices = _load_bundle_indices(args.b_merged_dir) or B_idx
         _assert_bundles(args.b_merged_dir, bm_indices)
         _rehydrate(model, args.b_merged_dir, bm_indices)
 
-        # C 복원
         C_bdir = args.bundles_dir
         _assert_bundles(C_bdir, C_idx)
         _rehydrate(model, C_bdir, C_idx)
@@ -509,8 +639,10 @@ def main():
         _enable_lora_only(model, C_idx, "stageC")
 
         out = os.path.join(args.out_adapters, "C_lora", "stageC")
-        train_adapter(model, tok, out, train_ds, eval_ds, args, "stageC")
+        train_elapsed = train_adapter(model, tok, out, train_ds, eval_ds, args, "stageC")
+        readme_extra["train_time"] = f"{train_elapsed/60:.1f} min"
 
+        _write_readme(out, t_start, time.time(), args, readme_extra)
         print(f"\n[Next] Merge C adapter with C bundle → C_merged")
 
     print("\n[Done] Training completed")
