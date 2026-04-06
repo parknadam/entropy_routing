@@ -15,16 +15,19 @@ def _to_inputs(
     batch: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]],
     device: torch.device,
 ) -> dict:
+    """
+    dataloader 출력을 HF CausalLM forward에 맞게 정규화.
+    - dict: 그대로 전달 (input_ids, attention_mask 등 이미 포함)
+    - tuple/list: data.py의 (input_ids, targets) 형태 → input_ids만 사용
+      (targets는 -100 값이므로 attention_mask로 쓰면 안 됨)
+    - tensor: input_ids로 간주
+    """
     if isinstance(batch, dict):
         return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
     elif isinstance(batch, (list, tuple)):
-        if len(batch) >= 2:
-            return {
-                "input_ids": batch[0].to(device, non_blocking=True),
-                "attention_mask": batch[1].to(device, non_blocking=True),
-            }
-        else:
-            return {"input_ids": batch[0].to(device, non_blocking=True)}
+        # data.py는 (input_ids, targets) 튜플을 반환
+        # targets는 loss 계산용이지 attention_mask가 아님 — input_ids만 전달
+        return {"input_ids": batch[0].to(device, non_blocking=True)}
     else:
         return {"input_ids": batch.to(device, non_blocking=True)}
 
@@ -56,21 +59,31 @@ def _compute_layer_inputs(
         handles.append(h)
 
     seen = 0
+    errors = 0
+    first_error = None
     for batch in dataloader:
         if seen >= max_batches:
             break
         try:
             inputs = _to_inputs(batch, device)
             model(**inputs)
-        except Exception:
-            pass
+        except Exception as e:
+            errors += 1
+            if first_error is None:
+                first_error = e
         seen += 1
 
     for h in handles:
         h.remove()
 
+    if errors > 0:
+        print(f"  [warn] Forward pass failed on {errors}/{seen} batches. First error: {first_error}")
+
     if not captured:
-        raise RuntimeError("No activations were captured. Check dataloader/model wiring.")
+        raise RuntimeError(
+            f"No activations were captured ({errors}/{seen} batches failed). "
+            f"First error: {first_error}"
+        )
 
     min_len = min(len(v) for v in captured.values())
     if min_len == 0:
@@ -78,6 +91,7 @@ def _compute_layer_inputs(
     for k in list(captured.keys()):
         captured[k] = captured[k][:min_len]
 
+    print(f"  [ok] Captured {min_len} batches across {len(captured)} layers")
     return captured, L
 
 
@@ -117,7 +131,12 @@ def choose_block_to_drop(
 
     eligible = [i for i in range(last_idx_exclusive) if i in captured and (i + n) in captured]
     if not eligible:
-        raise RuntimeError("No eligible start index for block drop (capture failed?).")
+        captured_keys = sorted(captured.keys())
+        raise RuntimeError(
+            f"No eligible start index for block drop. "
+            f"L={L}, n={n}, last_idx_exclusive={last_idx_exclusive}, "
+            f"captured layers={captured_keys}"
+        )
 
     best_ell, best_d = None, float("inf")
     for ell in eligible:
@@ -126,6 +145,9 @@ def choose_block_to_drop(
         d = math.acos(cos_val) / math.pi
         if d < best_d:
             best_d, best_ell = d, ell
+
+    if best_ell is None:
+        raise RuntimeError("choose_block_to_drop failed: no valid block found.")
 
     return best_ell, best_d, L
 

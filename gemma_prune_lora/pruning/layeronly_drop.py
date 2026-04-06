@@ -2,6 +2,7 @@
 레이어 드랍만 하는 코드 (Gemma / LLaMA / OPT 공용)
 
 # Gemma 7B IT
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m gemma_prune_lora.pruning.layeronly_drop \
   --model google/gemma-7b-it \
   --device cuda:0 \
@@ -13,6 +14,8 @@ python -m gemma_prune_lora.pruning.layeronly_drop \
   --save_dir ./gemma_7b_results/pruning/A \
   --save_removed_dir ./gemma_7b_results/pruning/bundles
 """
+
+
 
 import argparse
 import json
@@ -46,7 +49,7 @@ def _load_model(model_name: str, seqlen: int, device_str: str):
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map=None,
         attn_implementation="eager",
@@ -207,6 +210,12 @@ def main():
         keep_last_layer=args.keep_last_layer,
         max_batches=args.max_batches,
     )
+
+    if best_ell is None:
+        raise RuntimeError(
+            f"choose_block_to_drop returned None. "
+            f"Activation capture may have failed. Check model/data compatibility."
+        )
 
     if args.keep_last_layer and best_ell + n > L_full - 1:
         best_ell = max(0, L_full - 1 - n)

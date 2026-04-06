@@ -596,7 +596,7 @@ def merge_single_adapter(
     # [3] base model
     print("\n[3/6] Loading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
-        effective_base, torch_dtype=torch.float16,
+        effective_base, dtype=torch.float16,
         device_map=_device_map_from_arg(device), trust_remote_code=True,
     )
     n_layers = len(_get_model_layers(base_model))
@@ -679,7 +679,7 @@ def merge_multiple_adapters(
         dropped_layers = _read_dropped_layers_from_manifest(base_model_path, adapter_stage, stage_info)
 
         model = AutoModelForCausalLM.from_pretrained(
-            current_path, torch_dtype=torch.float16,
+            current_path, dtype=torch.float16,
             device_map=_device_map_from_arg(device), trust_remote_code=True,
         )
         model = PeftModel.from_pretrained(model, adapter_path)
