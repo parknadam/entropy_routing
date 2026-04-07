@@ -5,6 +5,20 @@ Utility to merge LoRA adapters into Falcon base models or bundles.
 Core behavior:
   A merge:  pruned A model + A LoRA -> save full HF model (PassLayer for B/C positions, ~10GB)
   B/C merge: bundle(B/C) + LoRA -> save only merged bundle layers (~1.6GB)
+# --output_dir /acpl-ssd32/test/llama/test_2048_epoch2_llama_7b_lora/A_merged \
+
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m falcon_prune_lora.pruning.falcon_merge_adapter \
+  --base_model ./falcon_results/pruning/A \
+  --adapter_path ./2048_falcon_lora_results/adapters/A_lora/stageA/checkpoint-625/stageA \
+  --output_dir /acpl-ssd32/test/llama/test_2048_epoch1_falcon_7b_lora/A_merged \
+  --device cuda:0
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+python -m falcon_prune_lora.pruning.falcon_merge_adapter \
+  --base_model ./falcon_results/pruning/A \
+  --adapter_path ./2048_falcon_lora_results/adapters/A_lora/stageA/checkpoint-1250/stageA \
+  --output_dir /acpl-ssd32/test/falcon/test_2048_epoch2_falcon_7b_lora/A_merged \
+  --device cuda:0
 
 Usage:
 # A merge (full model, B/C positions become PassLayer)

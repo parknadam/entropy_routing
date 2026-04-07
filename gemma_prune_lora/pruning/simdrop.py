@@ -99,10 +99,20 @@ def _mean_cos_over_batches(A_list: List[torch.Tensor], B_list: List[torch.Tensor
     cos_vals = []
     eps = 1e-8
     for A, B in zip(A_list, B_list):
+        finite_mask = torch.isfinite(A).all(dim=1) & torch.isfinite(B).all(dim=1)
+        if not torch.any(finite_mask):
+            continue
+        A = A[finite_mask]
+        B = B[finite_mask]
         dot = (A * B).sum(dim=1)
         denom = A.norm(dim=1) * B.norm(dim=1) + eps
         cos = dot / denom
+        cos = cos[torch.isfinite(cos)]
+        if cos.numel() == 0:
+            continue
         cos_vals.append(cos.mean().item())
+    if not cos_vals:
+        return float("nan")
     return float(sum(cos_vals) / len(cos_vals))
 
 
@@ -139,15 +149,27 @@ def choose_block_to_drop(
         )
 
     best_ell, best_d = None, float("inf")
+    invalid_count = 0
     for ell in eligible:
         cos_val = _mean_cos_over_batches(captured[ell], captured[ell + n])
+        if not math.isfinite(cos_val):
+            invalid_count += 1
+            continue
         cos_val = max(min(cos_val, 1.0), -1.0)
         d = math.acos(cos_val) / math.pi
+        if not math.isfinite(d):
+            invalid_count += 1
+            continue
         if d < best_d:
             best_d, best_ell = d, ell
 
     if best_ell is None:
-        raise RuntimeError("choose_block_to_drop failed: no valid block found.")
+        best_ell = eligible[len(eligible) // 2]
+        best_d = 0.5
+        print(
+            "  [warn] All eligible candidates produced non-finite distances "
+            f"(invalid={invalid_count}/{len(eligible)}). Falling back to start={best_ell}."
+        )
 
     return best_ell, best_d, L
 
