@@ -6,19 +6,20 @@ CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m gemma_prune_lora.pruning.layeronly_drop \
   --model google/gemma-7b-it \
   --device cuda:0 \
-  --drop_frac 0.25 \
+  --drop_frac 0.22 \
   --keep_last_layer \
   --nsamples 64 \
   --seqlen 1024 \
   --max_batches 32 \
-  --save_dir ./gemma_7b_results/pruning/A \
-  --save_removed_dir ./gemma_7b_results/pruning/bundles
+  --save_dir ./22_gemma_7b_results/pruning/A \
+  --save_removed_dir ./22_gemma_7b_results/pruning/bundles
 """
 
 
 
 import argparse
 import json
+import math
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -100,6 +101,45 @@ def build_layers_map(model, arch: str, out_path: str):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _build_selection_retry_schedule(requested_seqlen: int, min_seqlen: int):
+    requested_seqlen = max(1, int(requested_seqlen))
+    min_seqlen = max(1, min(int(min_seqlen), requested_seqlen))
+
+    schedule = []
+    cur = requested_seqlen
+    while True:
+        schedule.append(cur)
+        if cur <= min_seqlen:
+            break
+        nxt = max(min_seqlen, cur // 2)
+        if nxt == cur:
+            break
+        cur = nxt
+    return schedule
+
+
+def _should_retry_selection(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    retry_markers = (
+        "no complete activations were captured",
+        "no eligible start index",
+        "out of memory",
+        "incomplete activation capture",
+    )
+    return any(marker in msg for marker in retry_markers)
+
+
+def _format_selection_failure(L_full: int, n: int, attempts):
+    attempt_summary = ", ".join(f"{seqlen}:{msg}" for seqlen, msg in attempts)
+    return (
+        "Block selection failed after exhausting the selection sequence-length retries. "
+        f"L={L_full}, n={n}. Attempts: {attempt_summary}. "
+        "This usually means calibration forwards could not complete within the current GPU memory budget. "
+        "Try freeing GPU memory, using a less-occupied GPU, or rerunning with a smaller "
+        "--selection_seqlen / --seqlen."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="google/gemma-7b-it")
@@ -109,6 +149,8 @@ def main():
     ap.add_argument("--nsamples", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--selection_seqlen", type=int, default=None)
+    ap.add_argument("--min_selection_seqlen", type=int, default=128)
     ap.add_argument("--max_batches", type=int, default=64)
     ap.add_argument("--save_dir", type=str, default="./A")
     ap.add_argument("--save_removed_dir", type=str, default="./bundles")
@@ -154,7 +196,7 @@ def main():
     # ── [2] 블록 선택 & 번들 저장 ──
     print("[2/3] Angular-distance block selection & export bundles")
     L_full = get_num_layers(model, arch)
-    n = int(round(args.drop_frac * L_full))
+    n = math.floor(args.drop_frac * L_full)
 
     orig_cfg_dir = os.path.join(args.save_dir, "original_config")
 
@@ -182,7 +224,7 @@ def main():
                 "method": "angular_distance",
                 "block": {"start": None, "n": 0},
                 "angular_distance": None,
-                "keep_last_layer": True,
+                "keep_last_layer": args.keep_last_layer,
             },
             "stages": {
                 "A": {"kept_layers": kept_idx, "dropped_layers": removed_indices},
@@ -201,15 +243,54 @@ def main():
         print("[3/3] Done.")
         return
 
-    best_ell, best_d, _L_old = choose_block_to_drop(
-        model,
-        dataloader,
-        embed_dev,
-        n=n,
-        arch=arch,
-        keep_last_layer=args.keep_last_layer,
-        max_batches=args.max_batches,
+    requested_selection_seqlen = args.seqlen
+    if args.selection_seqlen is not None:
+        requested_selection_seqlen = min(args.selection_seqlen, args.seqlen)
+    retry_schedule = _build_selection_retry_schedule(
+        requested_selection_seqlen,
+        args.min_selection_seqlen,
     )
+
+    best_ell, best_d, _L_old = None, None, None
+    selection_failures = []
+    if requested_selection_seqlen != args.seqlen:
+        print(f"  [info] Using selection_seqlen={requested_selection_seqlen} for block search")
+
+    for attempt_idx, selection_seqlen in enumerate(retry_schedule, start=1):
+        if torch.cuda.is_available() and ("cuda" in str(embed_dev)):
+            torch.cuda.empty_cache()
+        try:
+            if len(retry_schedule) > 1:
+                print(
+                    f"  [try {attempt_idx}/{len(retry_schedule)}] "
+                    f"selection_seqlen={selection_seqlen}"
+                )
+            best_ell, best_d, _L_old = choose_block_to_drop(
+                model,
+                dataloader,
+                embed_dev,
+                n=n,
+                arch=arch,
+                keep_last_layer=args.keep_last_layer,
+                max_batches=args.max_batches,
+                input_seqlen=selection_seqlen,
+            )
+            break
+        except RuntimeError as e:
+            if not _should_retry_selection(e):
+                raise
+            selection_failures.append((selection_seqlen, str(e)))
+            if attempt_idx == len(retry_schedule):
+                raise RuntimeError(
+                    _format_selection_failure(L_full, n, selection_failures)
+                ) from e
+            next_selection_seqlen = retry_schedule[attempt_idx]
+            print(
+                f"  [warn] Block selection failed at selection_seqlen={selection_seqlen}: {e}"
+            )
+            print(
+                f"  [retry] Retrying block selection with selection_seqlen={next_selection_seqlen}"
+            )
 
     if best_ell is None:
         raise RuntimeError(
@@ -221,7 +302,7 @@ def main():
         best_ell = max(0, L_full - 1 - n)
 
     removed_indices = list(range(best_ell, best_ell + n))
-    if n > 0:
+    if n > 0 and args.keep_last_layer:
         assert removed_indices[-1] < (L_full - 1), "keep_last_layer 위반"
 
     P_total = _count_params(model)
@@ -298,7 +379,7 @@ def main():
             "method": "angular_distance",
             "block": {"start": int(best_ell), "n": int(n)},
             "angular_distance": float(best_d),
-            "keep_last_layer": True,
+            "keep_last_layer": args.keep_last_layer,
         },
         "stages": {
             "A": {"kept_layers": kept_idx, "dropped_layers": removed_indices},

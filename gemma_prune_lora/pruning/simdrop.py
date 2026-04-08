@@ -2,7 +2,7 @@
 # Angular-distance 기반 연속 n개 레이어 드랍 (Gemma / LLaMA / OPT 공용)
 
 import math
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ from .model_utils import get_layers
 def _to_inputs(
     batch: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]],
     device: torch.device,
+    max_input_tokens: Optional[int] = None,
 ) -> dict:
     """
     dataloader 출력을 HF CausalLM forward에 맞게 정규화.
@@ -22,14 +23,32 @@ def _to_inputs(
       (targets는 -100 값이므로 attention_mask로 쓰면 안 됨)
     - tensor: input_ids로 간주
     """
+    def maybe_trim(v):
+        if (
+            max_input_tokens is None
+            or not torch.is_tensor(v)
+            or v.ndim < 2
+            or v.shape[1] <= max_input_tokens
+        ):
+            return v
+        return v[:, -max_input_tokens:]
+
     if isinstance(batch, dict):
-        return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        return {
+            k: maybe_trim(v).to(device, non_blocking=True) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
     elif isinstance(batch, (list, tuple)):
         # data.py는 (input_ids, targets) 튜플을 반환
         # targets는 loss 계산용이지 attention_mask가 아님 — input_ids만 전달
-        return {"input_ids": batch[0].to(device, non_blocking=True)}
+        return {"input_ids": maybe_trim(batch[0]).to(device, non_blocking=True)}
     else:
-        return {"input_ids": batch.to(device, non_blocking=True)}
+        return {"input_ids": maybe_trim(batch).to(device, non_blocking=True)}
+
+
+def _is_oom_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda oom" in msg
 
 
 @torch.no_grad()
@@ -39,6 +58,7 @@ def _compute_layer_inputs(
     device: torch.device,
     arch: str,
     max_batches: int = 64,
+    input_seqlen: Optional[int] = None,
 ) -> Tuple[Dict[int, List[torch.Tensor]], int]:
 
     layers = get_layers(model, arch)
@@ -46,12 +66,16 @@ def _compute_layer_inputs(
 
     captured: Dict[int, List[torch.Tensor]] = {}
     handles: List[torch.utils.hooks.RemovableHandle] = []
+    batch_capture: Optional[Dict[int, torch.Tensor]] = None
 
     def make_hook(ell: int):
         def hook(mod: nn.Module, inputs):
+            nonlocal batch_capture
+            if batch_capture is None:
+                return
             x = inputs[0]
             x_last = x[:, -1, :].detach().float().cpu()
-            captured.setdefault(ell, []).append(x_last)
+            batch_capture[ell] = x_last
         return hook
 
     for ell, block in enumerate(layers):
@@ -60,29 +84,51 @@ def _compute_layer_inputs(
 
     seen = 0
     errors = 0
+    complete_batches = 0
     first_error = None
     for batch in dataloader:
         if seen >= max_batches:
             break
+        inputs = None
+        outputs = None
+        batch_capture = {}
         try:
-            inputs = _to_inputs(batch, device)
-            model(**inputs)
+            inputs = _to_inputs(batch, device, max_input_tokens=input_seqlen)
+            outputs = model(**inputs)
+            if len(batch_capture) != L:
+                raise RuntimeError(
+                    f"Incomplete activation capture: got {len(batch_capture)}/{L} layers "
+                    "from a forward that did not raise."
+                )
+            for ell in range(L):
+                captured.setdefault(ell, []).append(batch_capture[ell])
+            complete_batches += 1
         except Exception as e:
             errors += 1
             if first_error is None:
                 first_error = e
+            if _is_oom_error(e) and torch.cuda.is_available() and "cuda" in str(device):
+                torch.cuda.empty_cache()
+        finally:
+            batch_capture = None
+            del outputs
+            del inputs
         seen += 1
 
     for h in handles:
         h.remove()
 
     if errors > 0:
-        print(f"  [warn] Forward pass failed on {errors}/{seen} batches. First error: {first_error}")
+        print(
+            f"  [warn] Forward pass failed on {errors}/{seen} batches. "
+            f"Kept {complete_batches} complete batches. First error: {first_error}"
+        )
 
     if not captured:
         raise RuntimeError(
-            f"No activations were captured ({errors}/{seen} batches failed). "
-            f"First error: {first_error}"
+            f"No complete activations were captured ({errors}/{seen} batches failed). "
+            f"First error: {first_error}. "
+            "This usually means each forward failed before reaching the final layer."
         )
 
     min_len = min(len(v) for v in captured.values())
@@ -91,7 +137,7 @@ def _compute_layer_inputs(
     for k in list(captured.keys()):
         captured[k] = captured[k][:min_len]
 
-    print(f"  [ok] Captured {min_len} batches across {len(captured)} layers")
+    print(f"  [ok] Captured {min_len} complete batches across {len(captured)} layers")
     return captured, L
 
 
@@ -125,13 +171,21 @@ def choose_block_to_drop(
     arch: str = "gemma",
     keep_last_layer: bool = True,
     max_batches: int = 64,
+    input_seqlen: Optional[int] = None,
 ) -> Tuple[int, float, int]:
     """
     d(l) = (1/pi) * arccos( mean_cos( x(l), x(l+n) ) ) 를 최소화하는 시작 인덱스 l 선택
     반환: (best_l, best_d, 총 레이어 수 L)
     """
     model.eval()
-    captured, L = _compute_layer_inputs(model, dataloader, device, arch, max_batches=max_batches)
+    captured, L = _compute_layer_inputs(
+        model,
+        dataloader,
+        device,
+        arch,
+        max_batches=max_batches,
+        input_seqlen=input_seqlen,
+    )
 
     last_idx_exclusive = L - n
     if keep_last_layer:

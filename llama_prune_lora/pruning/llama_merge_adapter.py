@@ -12,23 +12,23 @@ Usage:
 CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/A \
-  --adapter_path ./2048_lora_results/adapters/A_lora/stageA/epoch_2/stageA \
-  --output_dir /acpl-ssd32/test/llama/test_2048_epoch2_llama_7b_lora/A_merged \
+  --adapter_path ./2048_lora_results/adapters/A_lora/stageA/stageA \
+  --output_dir ./merged_2048loraresults_llama7b/A_merged \
   --device cuda:0
 
 # B merge (bundle-only auto detection)
-CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/bundles/B \
-  --adapter_path ./lora_results/adapters/B_lora/stageB/stageB \
-  --output_dir ./new_merged_models_llama_7b_lora/B_merged \
+  --adapter_path ./2048_lora_results/adapters/B_lora/stageB/stageB \
+  --output_dir ./merged_2048loraresults_llama7b/B_merged \
   --device cuda:0
 
 # C merge (bundle-only auto detection)
 python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/bundles/C \
-  --adapter_path ./lora_results/adapters/C_lora/stageC/stageC \
-  --output_dir ./new_merged_models_llama_7b_lora/C_merged \
+  --adapter_path ./2048_lora_results/adapters/C_lora/stageC/stageC \
+  --output_dir ./merged_2048loraresults_llama7b/C_merged \
   --device cuda:0
 
 # 13b

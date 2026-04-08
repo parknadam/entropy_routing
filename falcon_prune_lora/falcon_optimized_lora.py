@@ -17,9 +17,9 @@ python -m falcon_prune_lora.falcon_optimized_lora \
   --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
 
 # Stage 2 (A_merged 기준)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
+  --base_dir ./merged_2048loraresults_falcon7b/A_merged \
   --bundles_dir ./falcon_results/pruning/bundles \
   --stage 2 --out_adapters ./2048_falcon_lora_results/adapters \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
@@ -27,8 +27,8 @@ python -m falcon_prune_lora.falcon_optimized_lora \
 # Stage 3 (A_merged + B_merged)
 CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_optimized_lora \
-  --base_dir ./merged_models_falcon/A_merged \
-  --b_merged_dir ./merged_models_falcon/B_merged \
+  --base_dir ./merged_2048loraresults_falcon7b/A_merged \
+  --b_merged_dir ./merged_2048loraresults_falcon7b/B_merged \
   --bundles_dir ./falcon_results/pruning/bundles/C \
   --stage 3 --out_adapters ./2048_falcon_lora_results/adapters \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32

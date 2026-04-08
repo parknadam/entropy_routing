@@ -6,6 +6,16 @@ Stage 1: A 로드 → 원본 레이아웃 보장 → B,C=PassLayer → A에만 L
 Stage 2: A_merged 로드 → 원본 레이아웃 보장 → B 복원 + C=PassLayer → B에만 LoRA
 Stage 3: A_merged 로드 → 원본 레이아웃 보장 → B_merged+C 복원 → C에만 LoRA
 
+#full 모델 실험
+# 경로 : /acpl-ssd32/llama2-7b/baseline_full_single
+CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
+python -m llama_prune_lora.optimized_lora \
+  --base_dir ./7b_results/pruning/A \
+  --bundles_dir ./7b_results/pruning/bundles \
+  --stage 1 --out_adapters ./2048_lora_results/adapters \
+  --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
+  --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+
 
 Usage:
 # 13b 실험
@@ -57,18 +67,18 @@ python -m llama_prune_lora.optimized_lora \
   --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
 
 # Stage 2 (A_merged 기준)
-CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.optimized_lora \
-  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
+  --base_dir ./merged_2048loraresults_llama7b/A_merged \
   --bundles_dir ./7b_results/pruning/bundles \
   --stage 2 --out_adapters ./2048_lora_results/adapters \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 
 # Stage 3 (A_merged + B_merged)
-CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.optimized_lora \
-  --base_dir ./new_merged_models_llama_7b_lora/A_merged \
-  --b_merged_dir ./new_merged_models_llama_7b_lora/B_merged \
+  --base_dir ./merged_2048loraresults_llama7b/A_merged \
+  --b_merged_dir ./merged_2048loraresults_llama7b/B_merged \
   --bundles_dir ./7b_results/pruning/bundles/C \
   --stage 3 --out_adapters ./2048_lora_results/adapters \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32

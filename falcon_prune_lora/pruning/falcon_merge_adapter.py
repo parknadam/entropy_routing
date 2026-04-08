@@ -22,24 +22,25 @@ python -m falcon_prune_lora.pruning.falcon_merge_adapter \
 
 Usage:
 # A merge (full model, B/C positions become PassLayer)
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/A \
-  --adapter_path ./modified_falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
-  --output_dir ./merged_models_falcon/A_merged \
+  --adapter_path ./2048_falcon_lora_results/adapters/A_lora/stageA/stageA \
+  --output_dir ./merged_2048loraresults_falcon7b/A_merged \
   --device cuda:0
 
 # B merge (bundle-only auto detection)
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/bundles/B \
-  --adapter_path ./falcon_kd_lora_results/adapters/B_lora/stageB \
-  --output_dir ./merged_models_falcon/B_merged \
+  --adapter_path ./2048_falcon_lora_results/adapters/B_lora/stageB \
+  --output_dir ./merged_2048loraresults_falcon7b/B_merged \
   --device cuda:0
 
 # C merge (bundle-only auto detection)
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/bundles/C \
-  --adapter_path ./falcon_kd_lora_results/adapters/C_lora/stageC \
-  --output_dir ./merged_models_falcon/C_merged \
+  --adapter_path ./2048_falcon_lora_results/adapters/C_lora/stageC \
+  --output_dir ./merged_2048loraresults_falcon7b/C_merged \
   --device cuda:0
 """
 
