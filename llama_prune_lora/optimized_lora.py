@@ -75,7 +75,7 @@ python -m llama_prune_lora.optimized_lora \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 
 # Stage 3 (A_merged + B_merged)
-CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
 python -m llama_prune_lora.optimized_lora \
   --base_dir ./merged_2048loraresults_llama7b/A_merged \
   --b_merged_dir ./merged_2048loraresults_llama7b/B_merged \

@@ -2,7 +2,7 @@
 레이어 드랍만 하는 코드 (Gemma / LLaMA / OPT 공용)
 
 # Gemma 7B IT
-CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
 python -m gemma_prune_lora.pruning.layeronly_drop \
   --model google/gemma-7b-it \
   --device cuda:0 \
@@ -11,8 +11,8 @@ python -m gemma_prune_lora.pruning.layeronly_drop \
   --nsamples 64 \
   --seqlen 1024 \
   --max_batches 32 \
-  --save_dir ./22_gemma_7b_results/pruning/A \
-  --save_removed_dir ./22_gemma_7b_results/pruning/bundles
+  --save_dir ./20_gemma_7b_results/pruning/A \
+  --save_removed_dir ./20_gemma_7b_results/pruning/bundles
 """
 
 

@@ -7,8 +7,8 @@
 """
 CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
 python -m gemma_prune_lora.eval_ppl \
-    --base_model ./gemma_7b_results/pruning/A \
-    --bundles_dir ./gemma_7b_results/pruning/bundles \
+    --base_model ./20_gemma_7b_results/pruning/A \
+    --bundles_dir ./20_gemma_7b_results/pruning/bundles \
     --text_file ./data/wikitext2_test.txt \
     --seqlen 1024 --batch_size 1 --max_batches 64 \
     --device cuda:0 --dtype bf16
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import json
 import math
 import re
 from pathlib import Path
@@ -75,10 +76,11 @@ class GemmaPassLayer(nn.Module):
         hidden_states,
         attention_mask=None,
         position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
+        past_key_values=None,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
+        output_attentions=False,
         **kwargs,
     ):
         if not self.return_tuple:
@@ -87,7 +89,7 @@ class GemmaPassLayer(nn.Module):
         if output_attentions:
             outputs += (None,)
         if use_cache:
-            outputs += (past_key_value,)
+            outputs += (past_key_values,)
         return outputs
 
 
@@ -116,6 +118,68 @@ def _build_layer_map(dir_path: Path) -> Dict[int, Path]:
         if match:
             out[int(match.group(1))] = path
     return out
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_indices(indices: List[int], num_layers: int) -> List[int]:
+    if not indices:
+        return []
+    uniq = sorted(set(int(i) for i in indices))
+    if all(0 <= i < num_layers for i in uniq):
+        return uniq
+    if all(1 <= i <= num_layers for i in uniq):
+        return [i - 1 for i in uniq]
+    raise ValueError(f"Layer indices out of range for num_layers={num_layers}: {uniq}")
+
+
+def _read_stage_layout(base_model_dir: Path, num_layers: int) -> Dict[str, Any]:
+    manifest = _load_json(base_model_dir / "manifest.json")
+    stages = manifest.get("stages", {}) if isinstance(manifest, dict) else {}
+
+    layout = {
+        "num_layers": int((manifest.get("counts", {}) or {}).get("L_full", num_layers)) if manifest else num_layers,
+        "A_dropped": [],
+        "B_removed": [],
+        "C_removed": [],
+    }
+
+    try:
+        layout["A_dropped"] = _normalize_indices(stages.get("A", {}).get("dropped_layers", []), num_layers)
+        layout["B_removed"] = _normalize_indices(stages.get("B", {}).get("removed_layers", []), num_layers)
+        layout["C_removed"] = _normalize_indices(stages.get("C", {}).get("removed_layers", []), num_layers)
+    except ValueError as exc:
+        print(f"[WARN] manifest stage indices look invalid: {exc}")
+
+    if not layout["A_dropped"]:
+        layers_map = _load_json(base_model_dir / "layers_map.json")
+        raw_layers = layers_map.get("layers", {}) if isinstance(layers_map, dict) else {}
+        inferred = []
+        for idx_str, param_names in raw_layers.items():
+            try:
+                idx = int(idx_str)
+            except Exception:
+                continue
+            if isinstance(param_names, list) and len(param_names) == 0:
+                inferred.append(idx)
+        try:
+            layout["A_dropped"] = _normalize_indices(inferred, num_layers)
+        except ValueError as exc:
+            print(f"[WARN] layers_map indices look invalid: {exc}")
+
+    if not layout["A_dropped"]:
+        layout["A_dropped"] = sorted(set(layout["B_removed"]) | set(layout["C_removed"]))
+
+    return layout
 
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
@@ -160,6 +224,7 @@ class DynamicStageManager:
     def __init__(
         self,
         model,
+        base_model_dir: Path,
         bundles_dir: Path,
         device: str,
         dtype: torch.dtype,
@@ -176,12 +241,26 @@ class DynamicStageManager:
         self.return_tuple = passlayer_return_tuple
 
         self.num_layers = len(self.layers)
+        self.layout = _read_stage_layout(base_model_dir, self.num_layers)
         B_raw = _build_layer_map(bundles_dir / "B")
         C_raw = _build_layer_map(bundles_dir / "C")
         self.B_map, self.C_map, self.index_shift = _maybe_shift_indices_to_zero_based(B_raw, C_raw, self.num_layers)
-        self.B_idx = sorted(self.B_map)
-        self.C_idx = sorted(self.C_map)
-        self.removed = sorted(set(self.B_idx) | set(self.C_idx))
+        self.B_idx = self.layout["B_removed"] or sorted(self.B_map)
+        self.C_idx = self.layout["C_removed"] or sorted(self.C_map)
+        self.removed = self.layout["A_dropped"] or sorted(set(self.B_idx) | set(self.C_idx))
+
+        if self.layout["num_layers"] != self.num_layers:
+            print(
+                f"[WARN] manifest L_full={self.layout['num_layers']} but loaded model has {self.num_layers} layers."
+            )
+
+        bundle_union = sorted(set(self.B_map) | set(self.C_map))
+        stage_union = sorted(set(self.B_idx) | set(self.C_idx))
+        if bundle_union and stage_union and bundle_union != stage_union:
+            print(
+                f"[WARN] manifest bundle indices {stage_union} differ from files on disk {bundle_union}. "
+                "Stage-A masking follows manifest; AB/FULL restore requires matching bundle files."
+            )
 
         self.set_stage("A")
 
@@ -192,6 +271,7 @@ class DynamicStageManager:
             "B": self.B_idx,
             "C": self.C_idx,
             "removed": self.removed,
+            "manifest_num_layers": self.layout["num_layers"],
         }
 
     def _pass_one_layer(self, layer_idx: int):
@@ -266,29 +346,51 @@ def _iter_textfile_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
-    tokens: List[int] = []
+    # Preserve the raw corpus layout so text_file evaluation is much closer to
+    # the built-in wikitext2 loader than line-wise tokenization with stripped blanks.
+    token_ids = _tokenize_text_corpus(tok, text_file)
+    if token_ids is None:
+        return
+
     made = 0
     batch_buf: List[torch.Tensor] = []
 
-    with text_file.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            ids = tok(line, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
-            tokens.extend(ids)
+    for start in range(0, token_ids.numel() - seqlen + 1, seqlen):
+        batch_buf.append(token_ids[start : start + seqlen].clone().long())
+        if len(batch_buf) == batch_size:
+            input_ids = torch.stack(batch_buf, dim=0).to(device)
+            yield {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids, dtype=torch.long)}
+            batch_buf = []
+            made += 1
+            if max_batches is not None and made >= max_batches:
+                return
 
-            while len(tokens) >= seqlen:
-                batch_buf.append(torch.tensor(tokens[:seqlen], dtype=torch.long))
-                tokens = tokens[seqlen:]
 
-                if len(batch_buf) == batch_size:
-                    input_ids = torch.stack(batch_buf, dim=0).to(device)
-                    yield {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids, dtype=torch.long)}
-                    batch_buf = []
-                    made += 1
-                    if max_batches is not None and made >= max_batches:
-                        return
+def _tokenize_text_corpus(tok: AutoTokenizer, text_file: Path) -> Optional[torch.Tensor]:
+    text = text_file.read_text(encoding="utf-8", errors="ignore")
+    if not text.strip():
+        return None
+    return tok(text, add_special_tokens=True, return_tensors="pt")["input_ids"][0].long()
+
+
+def _extract_corpus_ids(raw_loader: Any) -> Optional[torch.Tensor]:
+    if hasattr(raw_loader, "input_ids") and torch.is_tensor(raw_loader.input_ids):
+        raw_loader = raw_loader.input_ids
+
+    if torch.is_tensor(raw_loader):
+        ids = raw_loader[0] if raw_loader.dim() == 2 else raw_loader
+        return ids.long()
+
+    return None
+
+
+def _strip_leading_bos(input_ids: torch.Tensor, bos_token_id: Optional[int]) -> torch.Tensor:
+    ids = _ensure_2d(input_ids).cpu()[0]
+    if bos_token_id is None or ids.numel() == 0:
+        return ids
+    if int(ids[0]) == int(bos_token_id):
+        return ids[1:]
+    return ids
 
 
 def _normalize_loader_to_batches(
@@ -362,6 +464,131 @@ def _normalize_loader_to_batches(
                 return
 
     return _from_iter()
+
+
+@torch.no_grad()
+def eval_ppl_stride(
+    model,
+    input_ids: torch.Tensor,
+    seqlen: int,
+    stride: int,
+    device: str,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    input_ids = _ensure_2d(input_ids).cpu()
+    seq_len = input_ids.size(1)
+    if seq_len < 2:
+        return {"mean_nll": float("nan"), "ppl": float("nan"), "tokens": 0}
+
+    stride = max(1, min(int(stride), int(seqlen)))
+    sum_nll = 0.0
+    sum_tok = 0
+    prev_end = 0
+    windows = 0
+
+    for begin in range(0, seq_len, stride):
+        end = min(begin + seqlen, seq_len)
+        chunk = input_ids[:, begin:end].to(device)
+        if chunk.size(1) < 2:
+            break
+
+        logits = model(
+            input_ids=chunk,
+            attention_mask=torch.ones_like(chunk, dtype=torch.long),
+            use_cache=False,
+        ).logits
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = chunk[:, 1:].contiguous()
+
+        target_start = max(prev_end, begin + 1)
+        if target_start >= end:
+            prev_end = end
+            if end == seq_len:
+                break
+            continue
+
+        active_from = target_start - (begin + 1)
+        shift_mask = torch.zeros_like(shift_labels, dtype=torch.float32)
+        shift_mask[:, active_from:] = 1.0
+
+        vocab_size = shift_logits.size(-1)
+        loss_tok = F.cross_entropy(
+            shift_logits.float().view(-1, vocab_size),
+            shift_labels.view(-1),
+            reduction="none",
+        ).view_as(shift_labels).float()
+
+        sum_nll += float((loss_tok * shift_mask).sum().item())
+        sum_tok += int(shift_mask.sum().item())
+
+        prev_end = end
+        windows += 1
+        if max_batches is not None and windows >= max_batches:
+            break
+        if end == seq_len:
+            break
+
+    if sum_tok == 0:
+        return {"mean_nll": float("nan"), "ppl": float("nan"), "tokens": 0}
+
+    mean_nll = sum_nll / sum_tok
+    return {"mean_nll": mean_nll, "ppl": math.exp(mean_nll), "tokens": sum_tok}
+
+
+def eval_ppl_bos_blocks(
+    model,
+    input_ids: torch.Tensor,
+    seqlen: int,
+    bos_token_id: Optional[int],
+    device: str,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    if bos_token_id is None:
+        raise ValueError("bos_block mode requires tokenizer.bos_token_id")
+
+    ids = _strip_leading_bos(input_ids, bos_token_id)
+    if ids.numel() == 0 or seqlen < 2:
+        return {"mean_nll": float("nan"), "ppl": float("nan"), "tokens": 0}
+
+    step = max(1, int(seqlen) - 1)
+    bos = torch.tensor([[int(bos_token_id)]], dtype=torch.long)
+    sum_nll = 0.0
+    sum_tok = 0
+    blocks = 0
+
+    for start in range(0, ids.numel(), step):
+        content = ids[start : start + step]
+        if content.numel() == 0:
+            break
+
+        chunk = torch.cat([bos, content.unsqueeze(0)], dim=1).to(device)
+        logits = model(
+            input_ids=chunk,
+            attention_mask=torch.ones_like(chunk, dtype=torch.long),
+            use_cache=False,
+        ).logits
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = chunk[:, 1:].contiguous()
+        vocab_size = shift_logits.size(-1)
+
+        loss_tok = F.cross_entropy(
+            shift_logits.float().view(-1, vocab_size),
+            shift_labels.view(-1),
+            reduction="none",
+        ).view_as(shift_labels).float()
+
+        sum_nll += float(loss_tok.sum().item())
+        sum_tok += int(shift_labels.numel())
+        blocks += 1
+        if max_batches is not None and blocks >= max_batches:
+            break
+
+    if sum_tok == 0:
+        return {"mean_nll": float("nan"), "ppl": float("nan"), "tokens": 0}
+
+    mean_nll = sum_nll / sum_tok
+    return {"mean_nll": mean_nll, "ppl": math.exp(mean_nll), "tokens": sum_tok}
 
 
 @torch.no_grad()
@@ -468,11 +695,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base_model", required=True)
     ap.add_argument("--bundles_dir", required=True)
+    ap.add_argument("--baseline_model", default=None)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--dataset", default="wikitext2")
     ap.add_argument("--split", default="test")
     ap.add_argument("--seqlen", type=int, default=2048)
+    ap.add_argument("--stride", type=int, default=512)
+    ap.add_argument("--ppl_mode", default="auto", choices=["auto", "bos_block", "stride", "block"])
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--nsamples", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
@@ -499,6 +729,21 @@ def main():
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
+    if args.dtype == "fp16":
+        print("[WARN] Gemma perplexity can become unstable in fp16; bf16 is recommended.")
+
+    def choose_eval_mode(has_corpus_ids: bool) -> str:
+        bos_block_ok = has_corpus_ids and tok.bos_token_id is not None
+        if args.ppl_mode == "auto":
+            return "bos_block" if bos_block_ok else "stride" if has_corpus_ids else "block"
+        if args.ppl_mode == "bos_block" and not bos_block_ok:
+            print("[WARN] bos_block mode needs raw corpus ids and tokenizer.bos_token_id; falling back to block mode.")
+            return "block"
+        if args.ppl_mode == "stride" and not has_corpus_ids:
+            print("[WARN] stride mode needs raw corpus ids; falling back to block mode.")
+            return "block"
+        return args.ppl_mode
+
     def make_raw_loader():
         if args.text_file:
             return _iter_textfile_batches(
@@ -514,12 +759,101 @@ def main():
         raw = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, seqlen=args.seqlen, tokenizer=tok)
         return _pick_split(raw, args.split)
 
+    corpus_ids = _tokenize_text_corpus(tok, Path(args.text_file)) if args.text_file else None
+
+    def evaluate_model(model, label: str):
+        raw_loader = None
+        stride_ids = corpus_ids
+        loader_mode = choose_eval_mode(corpus_ids is not None)
+        if loader_mode == "bos_block":
+            metrics = eval_ppl_bos_blocks(
+                model=model,
+                input_ids=stride_ids,
+                seqlen=args.seqlen,
+                bos_token_id=tok.bos_token_id,
+                device=args.device,
+                max_batches=args.max_batches,
+            )
+        elif loader_mode == "stride":
+            metrics = eval_ppl_stride(
+                model=model,
+                input_ids=stride_ids,
+                seqlen=args.seqlen,
+                stride=args.stride,
+                device=args.device,
+                max_batches=args.max_batches,
+            )
+        else:
+            raw_loader = make_raw_loader()
+            if corpus_ids is None:
+                corpus_ids_local = _extract_corpus_ids(raw_loader)
+                local_mode = choose_eval_mode(corpus_ids_local is not None)
+                if local_mode == "stride" and corpus_ids_local is not None:
+                    stride_ids = corpus_ids_local
+                    metrics = eval_ppl_stride(
+                        model=model,
+                        input_ids=stride_ids,
+                        seqlen=args.seqlen,
+                        stride=args.stride,
+                        device=args.device,
+                        max_batches=args.max_batches,
+                    )
+                    loader_mode = "stride"
+                elif local_mode == "bos_block" and corpus_ids_local is not None:
+                    stride_ids = corpus_ids_local
+                    metrics = eval_ppl_bos_blocks(
+                        model=model,
+                        input_ids=stride_ids,
+                        seqlen=args.seqlen,
+                        bos_token_id=tok.bos_token_id,
+                        device=args.device,
+                        max_batches=args.max_batches,
+                    )
+                    loader_mode = "bos_block"
+                else:
+                    batches = list(
+                        _normalize_loader_to_batches(
+                            raw_loader=raw_loader,
+                            seqlen=args.seqlen,
+                            batch_size=args.batch_size,
+                            device=args.device,
+                            max_batches=args.max_batches,
+                        )
+                    )
+                    metrics = eval_ppl(model, iter(batches))
+            else:
+                batches = list(
+                    _normalize_loader_to_batches(
+                        raw_loader=raw_loader,
+                        seqlen=args.seqlen,
+                        batch_size=args.batch_size,
+                        device=args.device,
+                        max_batches=args.max_batches,
+                    )
+                )
+                metrics = eval_ppl(model, iter(batches))
+
+        print(
+            f"[{label}] BASE ppl={metrics['ppl']:.6f} | mean_nll={metrics['mean_nll']:.6f} | "
+            f"tokens={metrics['tokens']} | mode={loader_mode}"
+        )
+        return metrics, loader_mode, stride_ids
+
+    if args.baseline_model:
+        baseline_model = _load_model(args.baseline_model, dtype=dtype, device=args.device)
+        baseline_model.eval()
+        evaluate_model(baseline_model, "BASELINE")
+        del baseline_model
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
     for stage, label in [("A", "A"), ("AB", "AB"), ("FULL", "ABC")]:
         model = _load_model(args.base_model, dtype=dtype, device=args.device)
         model.eval()
 
         mgr = DynamicStageManager(
             model=model,
+            base_model_dir=Path(args.base_model),
             bundles_dir=Path(args.bundles_dir),
             device=args.device,
             dtype=dtype,
@@ -530,28 +864,48 @@ def main():
         if stage == "A":
             print("\n=== GROUP META ===")
             print(mgr.stage_meta())
-            print(f"device={args.device} dtype={args.dtype}\n")
 
-        raw_loader = make_raw_loader()
-        batches = list(
-            _normalize_loader_to_batches(
-                raw_loader=raw_loader,
-                seqlen=args.seqlen,
-                batch_size=args.batch_size,
-                device=args.device,
-                max_batches=args.max_batches,
-            )
-        )
+        metrics, loader_mode, stride_ids = evaluate_model(model, label)
 
-        metrics = eval_ppl(model, iter(batches))
-        print(f"[{label}] BASE ppl={metrics['ppl']:.6f} | mean_nll={metrics['mean_nll']:.6f} | tokens={metrics['tokens']}")
+        if stage == "A":
+            stride_desc = f" stride={min(args.stride, args.seqlen)}" if loader_mode == "stride" else ""
+            print(f"device={args.device} dtype={args.dtype} ppl_mode={loader_mode}{stride_desc}\n")
 
         for adapter_path in _parse_lora_list({"A": args.lora_A, "AB": args.lora_AB, "FULL": args.lora_FULL}[stage]):
             model_lora = _apply_lora_no_merge(model, adapter_path)
-            metrics_lora = eval_ppl(model_lora, iter(batches))
+            if loader_mode == "bos_block":
+                metrics_lora = eval_ppl_bos_blocks(
+                    model=model_lora,
+                    input_ids=stride_ids,
+                    seqlen=args.seqlen,
+                    bos_token_id=tok.bos_token_id,
+                    device=args.device,
+                    max_batches=args.max_batches,
+                )
+            elif loader_mode == "stride":
+                metrics_lora = eval_ppl_stride(
+                    model=model_lora,
+                    input_ids=stride_ids,
+                    seqlen=args.seqlen,
+                    stride=args.stride,
+                    device=args.device,
+                    max_batches=args.max_batches,
+                )
+            else:
+                raw_loader = make_raw_loader()
+                batches = list(
+                    _normalize_loader_to_batches(
+                        raw_loader=raw_loader,
+                        seqlen=args.seqlen,
+                        batch_size=args.batch_size,
+                        device=args.device,
+                        max_batches=args.max_batches,
+                    )
+                )
+                metrics_lora = eval_ppl(model_lora, iter(batches))
             print(
                 f"[{label}] LoRA({Path(adapter_path).name}) ppl={metrics_lora['ppl']:.6f} | "
-                f"mean_nll={metrics_lora['mean_nll']:.6f} | tokens={metrics_lora['tokens']}"
+                f"mean_nll={metrics_lora['mean_nll']:.6f} | tokens={metrics_lora['tokens']} | mode={loader_mode}"
             )
             del model_lora
 
