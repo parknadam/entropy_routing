@@ -2,11 +2,11 @@
 레이어 드랍만 하는 코드 (Gemma / LLaMA / OPT 공용)
 
 # Gemma 7B IT
-CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
 python -m gemma_prune_lora.pruning.layeronly_drop \
   --model google/gemma-7b-it \
   --device cuda:0 \
-  --drop_frac 0.22 \
+  --drop_frac 0.20 \
   --keep_last_layer \
   --nsamples 64 \
   --seqlen 1024 \

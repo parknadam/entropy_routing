@@ -5,7 +5,7 @@
 #
 # Example:
 """
-CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
 python -m gemma_prune_lora.eval_ppl \
     --base_model ./20_gemma_7b_results/pruning/A \
     --bundles_dir ./20_gemma_7b_results/pruning/bundles \

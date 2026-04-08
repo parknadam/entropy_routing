@@ -1,4 +1,4 @@
-# 레이어 보관 위한 코드 (Gemma / LLaMA / OPT 공용)
+# 레이어 보관 위한 코드 (Gemma 중심)
 import torch.nn as nn
 
 
@@ -8,26 +8,33 @@ class PassLayer(nn.Module):
     Gemma, LLaMA, OPT 모두 호환.
     """
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, return_tuple: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
+        self.return_tuple = return_tuple
 
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         position_ids=None,
+        past_key_values=None,
         past_key_value=None,
         output_attentions=False,
         use_cache=False,
         cache_position=None,
+        position_embeddings=None,
         **kwargs,
     ):
+        if not self.return_tuple:
+            return hidden_states
+
+        cache_obj = past_key_values if past_key_values is not None else past_key_value
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (None,)
         if use_cache:
-            outputs += (past_key_value,)
+            outputs += (cache_obj,)
         return outputs
 
 

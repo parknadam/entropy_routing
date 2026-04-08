@@ -33,8 +33,13 @@ import torch.nn as nn
 from peft import PeftModel
 from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
+except Exception:
+    GemmaDecoderLayer = None
 
 from .identity import PassLayer
+from .model_utils import detect_layer_return_tuple
 
 
 # ============================================================
@@ -71,6 +76,30 @@ def _read_stage_layers_from_manifest(base_model_path: str):
             (manifest.get("simdrop", {}) or {}).get("removed_layers", [])
         ),
     }
+
+
+def _read_manifest(base_model_path: str):
+    manifest_path = os.path.join(base_model_path, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        return manifest if isinstance(manifest, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_bundle_dirs_from_manifest(base_model_path: str):
+    manifest = _read_manifest(base_model_path)
+    artifacts = manifest.get("artifacts", {}) if isinstance(manifest, dict) else {}
+    out = {}
+    for stage in ("B", "C"):
+        entry = artifacts.get(stage, {}) if isinstance(artifacts, dict) else {}
+        dir_path = entry.get("dir") if isinstance(entry, dict) else None
+        if isinstance(dir_path, str) and dir_path:
+            out[stage] = os.path.abspath(dir_path) if os.path.exists(dir_path) else dir_path
+    return out
 
 
 def _infer_adapter_stage(adapter_path: str):
@@ -191,15 +220,54 @@ def _restore_passlayers(model, dropped_indices: list):
         return model
     layers = _get_model_layers(model)
     hidden_size = model.config.hidden_size
+    return_tuple = detect_layer_return_tuple(model)
     restored = []
     for idx in dropped_indices:
         if 0 <= idx < len(layers):
             old = layers[idx]
-            layers[idx] = PassLayer(hidden_size)
+            layers[idx] = PassLayer(hidden_size, return_tuple=return_tuple)
             del old
             restored.append(idx)
     if restored:
         print(f"  [ok] PassLayer restored: {len(restored)} layers {restored}")
+    return model
+
+
+def _rehydrate_layer_if_needed(model, idx: int):
+    layers = _get_model_layers(model)
+    if idx < 0 or idx >= len(layers):
+        raise IndexError(f"Layer idx {idx} out of range [0, {len(layers) - 1}]")
+
+    layer = layers[idx]
+    if not isinstance(layer, PassLayer):
+        return layer
+
+    if GemmaDecoderLayer is None:
+        raise RuntimeError("GemmaDecoderLayer import failed. Check transformers version.")
+
+    try:
+        dev = next(model.parameters()).device
+        dtype = next(model.parameters()).dtype
+    except StopIteration:
+        dev, dtype = torch.device("cpu"), torch.float32
+
+    try:
+        new_layer = GemmaDecoderLayer(model.config, idx)
+    except TypeError:
+        new_layer = GemmaDecoderLayer(model.config)
+    new_layer = new_layer.to(device=dev, dtype=dtype)
+
+    old = layers[idx]
+    layers[idx] = new_layer
+    del old
+    return new_layer
+
+
+def _restore_pruned_a_layout(model, stage_info: dict):
+    a_dropped = stage_info.get("A_dropped", []) if isinstance(stage_info, dict) else []
+    if a_dropped:
+        print(f"  Reapplying PassLayer layout for pruned A skeleton: {a_dropped}")
+        _restore_passlayers(model, a_dropped)
     return model
 
 
@@ -214,6 +282,7 @@ def _inject_bundle_layers_into_model(model, bundle_dir: str, indices: list):
     for idx in indices:
         if idx < 0 or idx >= len(layers):
             raise IndexError(f"Bundle layer idx {idx} out of range [0, {len(layers) - 1}]")
+        _rehydrate_layer_if_needed(model, idx)
         sf_path = _pick_bundle_layer_file(bundle_dir, idx)
         raw_sd = load_file(sf_path)
         layer_sd = _extract_layer_sd(raw_sd, idx)
@@ -582,6 +651,7 @@ def merge_single_adapter(
     if bundle_mode and not target_layers:
         target_layers = list(bundle_indices)
     dropped_layers = _read_dropped_layers_from_manifest(effective_base, adapter_stage, stage_info)
+    bundle_dirs = _resolve_bundle_dirs_from_manifest(effective_base)
 
     # [2] tokenizer
     if save_bundle_only:
@@ -601,6 +671,14 @@ def merge_single_adapter(
     )
     n_layers = len(_get_model_layers(base_model))
     print(f"  {n_layers} layers, {sum(p.numel() for p in base_model.parameters())/1e6:.1f}M params")
+    _restore_pruned_a_layout(base_model, stage_info)
+
+    if not bundle_mode and adapter_stage in {"B", "C"} and target_layers:
+        bundle_dir = bundle_dirs.get(adapter_stage)
+        if bundle_dir and os.path.isdir(bundle_dir):
+            _inject_bundle_layers_into_model(base_model, bundle_dir, target_layers)
+        else:
+            print(f"  [warn] Missing manifest bundle dir for stage {adapter_stage}; proceeding without bundle injection.")
     if bundle_mode:
         _inject_bundle_layers_into_model(base_model, bundle_dir, bundle_indices)
 
@@ -614,11 +692,8 @@ def merge_single_adapter(
     # [5] passlayers
     if save_bundle_only:
         print("\n[5/6] Skip PassLayer (bundle-only)")
-    elif adapter_stage == "A":
-        print("\n[5/6] Skip PassLayer for stage A (exclude on save)")
     else:
-        print("\n[5/6] Restoring PassLayers...")
-        merged_model = _restore_passlayers(merged_model, dropped_layers)
+        print("\n[5/6] PassLayer layout already applied on load")
 
     # [6] save
     if save_bundle_only:
@@ -668,42 +743,35 @@ def merge_multiple_adapters(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    current_path = base_model_path
-    temp_dirs = []
+    bundle_dirs = _resolve_bundle_dirs_from_manifest(base_model_path)
+    current_model = AutoModelForCausalLM.from_pretrained(
+        base_model_path, dtype=torch.float16,
+        device_map=_device_map_from_arg(device), trust_remote_code=True,
+    )
+    _restore_pruned_a_layout(current_model, stage_info)
 
     for i, adapter_path in enumerate(adapter_paths, 1):
-        is_last = i == len(adapter_paths)
         print(f"\n--- Stage {i}/{len(adapter_paths)}: {os.path.basename(adapter_path)} ---")
 
         adapter_stage, target_layers = _resolve_target_layers(base_model_path, adapter_path, stage_info)
-        dropped_layers = _read_dropped_layers_from_manifest(base_model_path, adapter_stage, stage_info)
+        if adapter_stage in {"B", "C"} and target_layers:
+            bundle_dir = bundle_dirs.get(adapter_stage)
+            if bundle_dir and os.path.isdir(bundle_dir):
+                _inject_bundle_layers_into_model(current_model, bundle_dir, target_layers)
+            else:
+                print(f"  [warn] Missing manifest bundle dir for stage {adapter_stage}; proceeding without bundle injection.")
 
-        model = AutoModelForCausalLM.from_pretrained(
-            current_path, dtype=torch.float16,
-            device_map=_device_map_from_arg(device), trust_remote_code=True,
-        )
-        model = PeftModel.from_pretrained(model, adapter_path)
+        model = PeftModel.from_pretrained(current_model, adapter_path)
         _enforce_adapter_scope(model, target_layers)
-        merged = model.merge_and_unload()
-        merged = _restore_passlayers(merged, dropped_layers)
+        current_model = model.merge_and_unload()
 
-        if is_last:
-            _save_complete_model(merged, tokenizer, output_dir, base_model_path)
-        else:
-            temp_dir = f"{output_dir}_temp_stage{i}"
-            _save_complete_model(merged, tokenizer, temp_dir, base_model_path)
-            current_path = temp_dir
-            temp_dirs.append(temp_dir)
-
-        del model, merged
+        del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    for td in temp_dirs:
-        try:
-            shutil.rmtree(td)
-        except Exception:
-            pass
+    _save_complete_model(current_model, tokenizer, output_dir, base_model_path)
+
+    del current_model
 
     if verify:
         _verify_merged_model(output_dir)

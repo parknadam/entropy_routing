@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from .identity import PassLayer
-from .model_utils import get_layers
+from .model_utils import detect_layer_return_tuple, get_layers
 
 
 def _to_inputs(
@@ -231,9 +231,10 @@ def choose_block_to_drop(
 def drop_consecutive_layers(model, ell: int, n: int, arch: str = "gemma"):
     layers = get_layers(model, arch)
     hidden_size = model.config.hidden_size
+    return_tuple = detect_layer_return_tuple(model)
 
     removed_indices = list(range(ell, ell + n))
     for i in removed_indices:
-        layers[i] = PassLayer(hidden_size)
+        layers[i] = PassLayer(hidden_size, return_tuple=return_tuple)
 
     return model, removed_indices
