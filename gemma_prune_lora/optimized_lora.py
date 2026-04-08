@@ -47,11 +47,6 @@ except Exception:
     GemmaDecoderLayer = None
 
 try:
-    from .pruning.identity import PassLayer
-except ImportError:
-    from gemma_prune_lora.pruning.identity import PassLayer
-
-try:
     from .pruning.model_utils import detect_layer_return_tuple as _shared_detect_layer_return_tuple
 except ImportError:
     try:
@@ -122,6 +117,33 @@ class EpochSaveCallback(TrainerCallback):
         with open(os.path.join(save_path, "epoch_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         print(f"[checkpoint] epoch {epoch_n} saved -> {save_path}")
+
+
+class _GemmaTrainPassLayer(nn.Module):
+    """
+    Gemma training path 전용 tensor-only pass layer.
+    현재 transformers Gemma decoder contract와 동일하게 hidden_states tensor만 반환합니다.
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.return_tuple = False
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        return hidden_states
 
 
 def _write_readme(out_dir, start_time, end_time=None, args=None, extra=None):
@@ -229,43 +251,11 @@ def _is_decoder_layer(module):
 
 def _make_pass_layer(hidden_size, return_tuple, device=None, dtype=None):
     """
-    PassLayer helper 버전 차이(`return_tuple` vs `ret_tuple`, hidden_size 유무)를 흡수합니다.
+    optimized_lora는 Gemma 전용 학습 경로이므로 tensor-only pass layer를 강제합니다.
+    외부 pruning.identity.PassLayer 버전 차이에 영향받지 않도록 로컬 구현을 사용합니다.
     """
-    attempts = (
-        lambda: PassLayer(hidden_size, return_tuple=return_tuple),
-        lambda: PassLayer(hidden_size, ret_tuple=return_tuple),
-        lambda: PassLayer(return_tuple=return_tuple),
-        lambda: PassLayer(ret_tuple=return_tuple),
-        lambda: PassLayer(hidden_size, return_tuple),
-        lambda: PassLayer(return_tuple),
-        lambda: PassLayer(),
-    )
-    last_error = None
-    layer = None
-    for factory in attempts:
-        try:
-            layer = factory()
-            break
-        except TypeError as exc:
-            last_error = exc
-    if layer is None:
-        raise last_error
-
-    if hasattr(layer, "hidden_size"):
-        try:
-            layer.hidden_size = hidden_size
-        except Exception:
-            pass
-    if hasattr(layer, "return_tuple"):
-        try:
-            layer.return_tuple = return_tuple
-        except Exception:
-            pass
-    if hasattr(layer, "ret_tuple"):
-        try:
-            layer.ret_tuple = return_tuple
-        except Exception:
-            pass
+    del return_tuple
+    layer = _GemmaTrainPassLayer(hidden_size)
 
     if device is not None:
         try:
@@ -281,7 +271,8 @@ def _ensure_original_layout(model, removed_indices, original_num_layers):
     removed = sorted(set(int(i) for i in removed_indices))
     kept = sorted(set(range(original_num_layers)) - set(removed))
     hidden_size = int(model.config.hidden_size)
-    return_tuple = detect_layer_return_tuple(model)
+    # Gemma current HF runtime expects decoder layers to return a tensor, not a tuple.
+    return_tuple = False
 
     try:
         ref_param = next(model.parameters())
