@@ -514,6 +514,23 @@ def _maybe_report_cuda_mem(enabled: bool, label: str, device: str):
     )
 
 
+def _build_oom_retry_seqlens(requested_seqlen: int, min_seqlen: Optional[int]) -> List[int]:
+    requested_seqlen = max(2, int(requested_seqlen))
+    if min_seqlen is None:
+        return [requested_seqlen]
+
+    min_seqlen = max(2, min(int(min_seqlen), requested_seqlen))
+    schedule = [requested_seqlen]
+    cur = requested_seqlen
+    while cur > min_seqlen:
+        nxt = max(min_seqlen, cur // 2)
+        if nxt == cur:
+            break
+        schedule.append(nxt)
+        cur = nxt
+    return schedule
+
+
 @torch.no_grad()
 def eval_ppl_stride(
     model,
@@ -769,6 +786,7 @@ def main():
     ap.add_argument("--restore_mode", default="strict", choices=["strict", "warn"])
     ap.add_argument("--loss_dtype", default="fp32", choices=["model", "bf16", "fp16", "fp32"])
     ap.add_argument("--report_cuda_mem", action="store_true")
+    ap.add_argument("--oom_retry_min_seqlen", type=int, default=None)
     args = ap.parse_args()
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
@@ -808,24 +826,26 @@ def main():
             return "block"
         return args.ppl_mode
 
-    def make_raw_loader():
+    retry_seqlens = _build_oom_retry_seqlens(args.seqlen, args.oom_retry_min_seqlen)
+
+    def make_raw_loader(seqlen: int):
         if args.text_file:
             return _iter_textfile_batches(
                 tok=tok,
                 text_file=Path(args.text_file),
-                seqlen=args.seqlen,
+                seqlen=seqlen,
                 batch_size=args.batch_size,
                 device=args.device,
                 max_batches=args.max_batches,
             )
         if get_loaders is None:
             raise RuntimeError("gemma_prune_lora.pruning.data.get_loaders import failed. Use --text_file instead.")
-        raw = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, seqlen=args.seqlen, tokenizer=tok)
+        raw = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, seqlen=seqlen, tokenizer=tok)
         return _pick_split(raw, args.split)
 
     corpus_ids = _tokenize_text_corpus(tok, Path(args.text_file)) if args.text_file else None
 
-    def evaluate_model(model, label: str):
+    def _evaluate_loaded_model_once(model, seqlen: int):
         raw_loader = None
         stride_ids = corpus_ids
         loader_mode = choose_eval_mode(corpus_ids is not None)
@@ -833,7 +853,7 @@ def main():
             metrics = eval_ppl_bos_blocks(
                 model=model,
                 input_ids=stride_ids,
-                seqlen=args.seqlen,
+                seqlen=seqlen,
                 bos_token_id=tok.bos_token_id,
                 device=args.device,
                 loss_dtype=loss_dtype,
@@ -843,14 +863,14 @@ def main():
             metrics = eval_ppl_stride(
                 model=model,
                 input_ids=stride_ids,
-                seqlen=args.seqlen,
+                seqlen=seqlen,
                 stride=args.stride,
                 device=args.device,
                 loss_dtype=loss_dtype,
                 max_batches=args.max_batches,
             )
         else:
-            raw_loader = make_raw_loader()
+            raw_loader = make_raw_loader(seqlen)
             if corpus_ids is None:
                 corpus_ids_local = _extract_corpus_ids(raw_loader)
                 local_mode = choose_eval_mode(corpus_ids_local is not None)
@@ -859,7 +879,7 @@ def main():
                     metrics = eval_ppl_stride(
                         model=model,
                         input_ids=stride_ids,
-                        seqlen=args.seqlen,
+                        seqlen=seqlen,
                         stride=args.stride,
                         device=args.device,
                         loss_dtype=loss_dtype,
@@ -871,7 +891,7 @@ def main():
                     metrics = eval_ppl_bos_blocks(
                         model=model,
                         input_ids=stride_ids,
-                        seqlen=args.seqlen,
+                        seqlen=seqlen,
                         bos_token_id=tok.bos_token_id,
                         device=args.device,
                         loss_dtype=loss_dtype,
@@ -882,7 +902,7 @@ def main():
                     batches = list(
                         _normalize_loader_to_batches(
                             raw_loader=raw_loader,
-                            seqlen=args.seqlen,
+                            seqlen=seqlen,
                             batch_size=args.batch_size,
                             device=args.device,
                             max_batches=args.max_batches,
@@ -893,7 +913,7 @@ def main():
                 batches = list(
                     _normalize_loader_to_batches(
                         raw_loader=raw_loader,
-                        seqlen=args.seqlen,
+                        seqlen=seqlen,
                         batch_size=args.batch_size,
                         device=args.device,
                         max_batches=args.max_batches,
@@ -901,18 +921,44 @@ def main():
                 )
                 metrics = eval_ppl(model, iter(batches), loss_dtype=loss_dtype)
 
-        print(
-            f"[{label}] BASE ppl={metrics['ppl']:.6f} | mean_nll={metrics['mean_nll']:.6f} | "
-            f"tokens={metrics['tokens']} | mode={loader_mode}"
-        )
         return metrics, loader_mode, stride_ids
+
+    def evaluate_loaded_model(model, label: str, metric_name: str):
+        attempts = []
+        for seqlen in retry_seqlens:
+            try:
+                metrics, loader_mode, stride_ids = _evaluate_loaded_model_once(model, seqlen)
+                print(
+                    f"[{label}] {metric_name} ppl={metrics['ppl']:.6f} | mean_nll={metrics['mean_nll']:.6f} | "
+                    f"tokens={metrics['tokens']} | mode={loader_mode} | seqlen={seqlen}"
+                )
+                return metrics, loader_mode, stride_ids, seqlen
+            except torch.OutOfMemoryError as exc:
+                attempts.append(seqlen)
+                print(f"[WARN] [{label}] OOM at seqlen={seqlen} during {metric_name}; retrying with a smaller seqlen.")
+                _maybe_report_cuda_mem(
+                    args.report_cuda_mem,
+                    f"{label}:{metric_name}:oom@seqlen={seqlen}",
+                    args.device,
+                )
+                if args.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                if seqlen == retry_seqlens[-1]:
+                    attempted = ", ".join(str(v) for v in attempts)
+                    raise RuntimeError(
+                        f"[{label}] {metric_name} exhausted OOM seqlen retries. "
+                        f"Tried seqlen={attempted}. "
+                        "Use a smaller initial --seqlen, a lower --oom_retry_min_seqlen, or a less-occupied GPU."
+                    ) from exc
+
+        raise RuntimeError(f"[{label}] {metric_name} evaluation did not run.")
 
     if args.baseline_model:
         baseline_model = _load_model(args.baseline_model, dtype=dtype, device=args.device)
         baseline_model.eval()
         _maybe_report_cuda_mem(args.report_cuda_mem, "BASELINE:after_load", args.device)
         _reset_cuda_peak(args.device)
-        evaluate_model(baseline_model, "BASELINE")
+        evaluate_loaded_model(baseline_model, "BASELINE", "BASE")
         _maybe_report_cuda_mem(args.report_cuda_mem, "BASELINE:after_eval", args.device)
         del baseline_model
         if args.device.startswith("cuda"):
@@ -944,54 +990,24 @@ def main():
             print("\n=== GROUP META ===")
             print(mgr.stage_meta())
 
-        metrics, loader_mode, stride_ids = evaluate_model(model, label)
+        metrics, loader_mode, stride_ids, used_seqlen = evaluate_loaded_model(model, label, "BASE")
         _maybe_report_cuda_mem(args.report_cuda_mem, f"{label}:after_eval", args.device)
 
         if stage == "A" or args.stage != "ALL":
-            stride_desc = f" stride={min(args.stride, args.seqlen)}" if loader_mode == "stride" else ""
+            stride_desc = f" stride={min(args.stride, used_seqlen)}" if loader_mode == "stride" else ""
             print(
                 f"device={args.device} dtype={args.dtype} loss_dtype={args.loss_dtype} "
-                f"restore_mode={args.restore_mode} stage={stage} ppl_mode={loader_mode}{stride_desc}\n"
+                f"restore_mode={args.restore_mode} stage={stage} seqlen={used_seqlen} "
+                f"ppl_mode={loader_mode}{stride_desc}\n"
             )
 
         for adapter_path in _parse_lora_list({"A": args.lora_A, "AB": args.lora_AB, "FULL": args.lora_FULL}[stage]):
             model_lora = _apply_lora_no_merge(model, adapter_path)
             _reset_cuda_peak(args.device)
-            if loader_mode == "bos_block":
-                metrics_lora = eval_ppl_bos_blocks(
-                    model=model_lora,
-                    input_ids=stride_ids,
-                    seqlen=args.seqlen,
-                    bos_token_id=tok.bos_token_id,
-                    device=args.device,
-                    loss_dtype=loss_dtype,
-                    max_batches=args.max_batches,
-                )
-            elif loader_mode == "stride":
-                metrics_lora = eval_ppl_stride(
-                    model=model_lora,
-                    input_ids=stride_ids,
-                    seqlen=args.seqlen,
-                    stride=args.stride,
-                    device=args.device,
-                    loss_dtype=loss_dtype,
-                    max_batches=args.max_batches,
-                )
-            else:
-                raw_loader = make_raw_loader()
-                batches = list(
-                    _normalize_loader_to_batches(
-                        raw_loader=raw_loader,
-                        seqlen=args.seqlen,
-                        batch_size=args.batch_size,
-                        device=args.device,
-                        max_batches=args.max_batches,
-                    )
-                )
-                metrics_lora = eval_ppl(model_lora, iter(batches), loss_dtype=loss_dtype)
-            print(
-                f"[{label}] LoRA({Path(adapter_path).name}) ppl={metrics_lora['ppl']:.6f} | "
-                f"mean_nll={metrics_lora['mean_nll']:.6f} | tokens={metrics_lora['tokens']} | mode={loader_mode}"
+            metrics_lora, _, _, _ = evaluate_loaded_model(
+                model_lora,
+                label,
+                f"LoRA({Path(adapter_path).name})",
             )
             _maybe_report_cuda_mem(args.report_cuda_mem, f"{label}:LoRA({Path(adapter_path).name})", args.device)
             del model_lora

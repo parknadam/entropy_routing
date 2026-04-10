@@ -25,7 +25,7 @@ python -m falcon_prune_lora.falcon_optimized_lora \
   --seq_len 2048 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 
 # Stage 3 (A_merged + B_merged)
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_optimized_lora \
   --base_dir ./merged_2048loraresults_falcon7b/A_merged \
   --b_merged_dir ./merged_2048loraresults_falcon7b/B_merged \

@@ -12,9 +12,9 @@ CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
 python -m llama_prune_lora.full_lora \
   --base_dir /acpl-ssd32/llama2-7b/baseline_full_single \
   --stage 3 \
-  --out_adapters ./2048_fullmodel_lora_results/adapters \
+  --out_adapters ./no_2048_fullmodel_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 2048 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+  --seq_len 3096 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
 
 2) Pruned A model + bundles -> restore B/C and train FULL(ABC)
 CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \

@@ -145,18 +145,21 @@ def _normalize_indices(indices: List[int], num_layers: int) -> List[int]:
 def _read_stage_layout(base_model_dir: Path, num_layers: int) -> Dict[str, Any]:
     manifest = _load_json(base_model_dir / "manifest.json")
     stages = manifest.get("stages", {}) if isinstance(manifest, dict) else {}
+    manifest_layers = int((manifest.get("counts", {}) or {}).get("L_full", num_layers)) if manifest else num_layers
 
     layout = {
-        "num_layers": int((manifest.get("counts", {}) or {}).get("L_full", num_layers)) if manifest else num_layers,
+        "num_layers": manifest_layers,
+        "A_kept": [],
         "A_dropped": [],
         "B_removed": [],
         "C_removed": [],
     }
 
     try:
-        layout["A_dropped"] = _normalize_indices(stages.get("A", {}).get("dropped_layers", []), num_layers)
-        layout["B_removed"] = _normalize_indices(stages.get("B", {}).get("removed_layers", []), num_layers)
-        layout["C_removed"] = _normalize_indices(stages.get("C", {}).get("removed_layers", []), num_layers)
+        layout["A_kept"] = _normalize_indices(stages.get("A", {}).get("kept_layers", []), manifest_layers)
+        layout["A_dropped"] = _normalize_indices(stages.get("A", {}).get("dropped_layers", []), manifest_layers)
+        layout["B_removed"] = _normalize_indices(stages.get("B", {}).get("removed_layers", []), manifest_layers)
+        layout["C_removed"] = _normalize_indices(stages.get("C", {}).get("removed_layers", []), manifest_layers)
     except ValueError as exc:
         print(f"[WARN] manifest stage indices look invalid: {exc}")
 
@@ -178,8 +181,63 @@ def _read_stage_layout(base_model_dir: Path, num_layers: int) -> Dict[str, Any]:
 
     if not layout["A_dropped"]:
         layout["A_dropped"] = sorted(set(layout["B_removed"]) | set(layout["C_removed"]))
+    if not layout["A_kept"] and layout["A_dropped"]:
+        dropped_set = set(layout["A_dropped"])
+        layout["A_kept"] = [idx for idx in range(layout["num_layers"]) if idx not in dropped_set]
 
     return layout
+
+
+def _set_layers(model, new_layers: List[nn.Module]) -> None:
+    layer_list = nn.ModuleList(list(new_layers))
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.model.layers = layer_list
+        return
+    if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
+        model.model.model.layers = layer_list
+        return
+    raise RuntimeError("Gemma layers path not found while setting layers.")
+
+
+def _ensure_original_layout(model, layout: Dict[str, Any], return_tuple: bool) -> Any:
+    layers = _get_layers(model)
+    current_num_layers = len(layers)
+    original_num_layers = int(layout.get("num_layers", current_num_layers) or current_num_layers)
+    removed = sorted(set(int(i) for i in layout.get("A_dropped", [])))
+    kept = sorted(set(int(i) for i in layout.get("A_kept", [])))
+
+    if not kept and removed:
+        removed_set = set(removed)
+        kept = [idx for idx in range(original_num_layers) if idx not in removed_set]
+
+    hidden_size = getattr(model.config, "hidden_size", 0)
+
+    if current_num_layers == original_num_layers:
+        for idx in removed:
+            if 0 <= idx < len(layers) and not isinstance(layers[idx], GemmaPassLayer):
+                old = layers[idx]
+                layers[idx] = GemmaPassLayer(hidden_size, return_tuple=return_tuple)
+                del old
+        model.config.num_hidden_layers = original_num_layers
+        return model
+
+    if kept and current_num_layers == len(kept):
+        old_layers = [layers[i] for i in range(current_num_layers)]
+        new_layers: List[Optional[nn.Module]] = [None] * original_num_layers
+        for packed_idx, original_idx in enumerate(kept):
+            new_layers[original_idx] = old_layers[packed_idx]
+        for idx in removed:
+            new_layers[idx] = GemmaPassLayer(hidden_size, return_tuple=return_tuple)
+        if any(layer is None for layer in new_layers):
+            raise RuntimeError("Expanded Gemma layout contains empty layer slots.")
+        _set_layers(model, new_layers)
+        model.config.num_hidden_layers = original_num_layers
+        return model
+
+    raise RuntimeError(
+        f"Cannot reconstruct Gemma layout: loaded={current_num_layers}, "
+        f"kept={len(kept)}, original={original_num_layers}"
+    )
 
 
 def _strip_layer_prefix(sd: Dict[str, torch.Tensor], layer_idx: int) -> Dict[str, torch.Tensor]:
@@ -652,6 +710,8 @@ def _load_model(base_model: str, dtype: torch.dtype, device: str):
     for kwargs in attempts:
         try:
             model = AutoModelForCausalLM.from_pretrained(base_model, low_cpu_mem_usage=True, **kwargs)
+            layout = _read_stage_layout(Path(base_model), len(_get_layers(model)))
+            model = _ensure_original_layout(model, layout, return_tuple=_detect_layer_return_tuple(model))
             model = model.to(device)
             if hasattr(model.config, "use_cache"):
                 model.config.use_cache = False

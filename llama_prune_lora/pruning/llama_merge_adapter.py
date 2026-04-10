@@ -25,6 +25,7 @@ python -m llama_prune_lora.pruning.llama_merge_adapter \
   --device cuda:0
 
 # C merge (bundle-only auto detection)
+CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
 python -m llama_prune_lora.pruning.llama_merge_adapter \
   --base_model ./7b_results/pruning/bundles/C \
   --adapter_path ./2048_lora_results/adapters/C_lora/stageC/stageC \

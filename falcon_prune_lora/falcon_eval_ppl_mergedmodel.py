@@ -14,11 +14,11 @@ python -m falcon_prune_lora.falcon_eval_ppl_mergedmodel \
 
 # A / AB / FULL stage 비교 (머지된 B/C 번들 사용)
 python -m falcon_prune_lora.falcon_eval_ppl_mergedmodel \
-  --model_path ./merged_models_falcon/A_merged \
-  --b_bundle ./merged_models_falcon/B_merged \
-  --c_bundle ./merged_models_falcon/C_merged \
+  --model_path ./merged_2048loraresults_falcon7b/A_merged \
+  --b_bundle ./merged_2048loraresults_falcon7b/B_merged \
+  --c_bundle ./merged_2048loraresults_falcon7b/C_merged \
   --stages A,AB,FULL \
-  --device cuda:2
+  --device cuda:0
 
 # 원본 모델과 비교
 python -m falcon_prune_lora.falcon_eval_ppl_mergedmodel \

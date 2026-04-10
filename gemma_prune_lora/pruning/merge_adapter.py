@@ -59,15 +59,31 @@ def _unique_sorted_ints(indices):
 def _read_stage_layers_from_manifest(base_model_path: str):
     manifest_path = os.path.join(base_model_path, "manifest.json")
     if not os.path.isfile(manifest_path):
-        return {"A_kept": [], "A_dropped": [], "B_removed": [], "C_removed": [], "simdrop_removed": []}
+        return {
+            "L_full": None,
+            "A_kept": [],
+            "A_dropped": [],
+            "B_removed": [],
+            "C_removed": [],
+            "simdrop_removed": [],
+        }
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
     except Exception:
-        return {"A_kept": [], "A_dropped": [], "B_removed": [], "C_removed": [], "simdrop_removed": []}
+        return {
+            "L_full": None,
+            "A_kept": [],
+            "A_dropped": [],
+            "B_removed": [],
+            "C_removed": [],
+            "simdrop_removed": [],
+        }
 
     stages = manifest.get("stages", {}) or {}
+    counts = manifest.get("counts", {}) or {}
     return {
+        "L_full": counts.get("L_full"),
         "A_kept": _unique_sorted_ints(stages.get("A", {}).get("kept_layers", [])),
         "A_dropped": _unique_sorted_ints(stages.get("A", {}).get("dropped_layers", [])),
         "B_removed": _unique_sorted_ints(stages.get("B", {}).get("removed_layers", [])),
@@ -212,6 +228,28 @@ def _get_model_layers(model):
     raise RuntimeError("Cannot find decoder layers")
 
 
+def _set_model_layers(model, new_layers):
+    layer_list = nn.ModuleList(list(new_layers))
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        model.model.layers = layer_list
+        return
+    if hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "layers"):
+        model.model.model.layers = layer_list
+        return
+    if hasattr(model, "base_model"):
+        base = model.base_model
+        if hasattr(base, "model") and hasattr(base.model, "model") and hasattr(base.model.model, "layers"):
+            base.model.model.layers = layer_list
+            return
+        if hasattr(base, "model") and hasattr(base.model, "layers"):
+            base.model.layers = layer_list
+            return
+    if hasattr(model, "model") and hasattr(model.model, "decoder") and hasattr(model.model.decoder, "layers"):
+        model.model.decoder.layers = layer_list
+        return
+    raise RuntimeError("Cannot set decoder layers")
+
+
 # ============================================================
 # PassLayer restore
 # ============================================================
@@ -231,6 +269,68 @@ def _restore_passlayers(model, dropped_indices: list):
     if restored:
         print(f"  [ok] PassLayer restored: {len(restored)} layers {restored}")
     return model
+
+
+def _ensure_original_layout(model, stage_info: dict):
+    stage_info = stage_info or {}
+    layers = _get_model_layers(model)
+    current_num_layers = len(layers)
+
+    removed = _unique_sorted_ints(stage_info.get("A_dropped", []))
+    kept = _unique_sorted_ints(stage_info.get("A_kept", []))
+    original_num_layers = int(
+        stage_info.get("L_full")
+        or (max(removed + kept) + 1 if (removed or kept) else current_num_layers)
+    )
+
+    if not removed and current_num_layers == original_num_layers:
+        model.config.num_hidden_layers = original_num_layers
+        return model
+
+    if not kept and removed:
+        removed_set = set(removed)
+        kept = [idx for idx in range(original_num_layers) if idx not in removed_set]
+
+    try:
+        ref_param = next(model.parameters())
+        device, dtype = ref_param.device, ref_param.dtype
+    except StopIteration:
+        device, dtype = torch.device("cpu"), torch.float32
+
+    return_tuple = detect_layer_return_tuple(model)
+    hidden_size = int(model.config.hidden_size)
+
+    if current_num_layers == original_num_layers:
+        changed = []
+        for idx in removed:
+            if 0 <= idx < len(layers) and not isinstance(layers[idx], PassLayer):
+                old = layers[idx]
+                layers[idx] = PassLayer(hidden_size, return_tuple=return_tuple).to(device=device, dtype=dtype)
+                del old
+                changed.append(idx)
+        model.config.num_hidden_layers = original_num_layers
+        if changed:
+            print(f"  Reapplied PassLayer layout: {changed}")
+        return model
+
+    if kept and current_num_layers == len(kept):
+        print(f"  Expanding compact layout: {current_num_layers} -> {original_num_layers}")
+        old_layers = [layers[i] for i in range(current_num_layers)]
+        new_layers = [None] * original_num_layers
+        for packed_idx, original_idx in enumerate(kept):
+            new_layers[original_idx] = old_layers[packed_idx]
+        for idx in removed:
+            new_layers[idx] = PassLayer(hidden_size, return_tuple=return_tuple).to(device=device, dtype=dtype)
+        if any(layer is None for layer in new_layers):
+            raise RuntimeError("Expanded layout contains empty layer slots.")
+        _set_model_layers(model, new_layers)
+        model.config.num_hidden_layers = original_num_layers
+        return model
+
+    raise RuntimeError(
+        f"Cannot reconstruct original layout: loaded={current_num_layers}, "
+        f"kept={len(kept)}, original={original_num_layers}"
+    )
 
 
 def _rehydrate_layer_if_needed(model, idx: int):
@@ -264,11 +364,7 @@ def _rehydrate_layer_if_needed(model, idx: int):
 
 
 def _restore_pruned_a_layout(model, stage_info: dict):
-    a_dropped = stage_info.get("A_dropped", []) if isinstance(stage_info, dict) else []
-    if a_dropped:
-        print(f"  Reapplying PassLayer layout for pruned A skeleton: {a_dropped}")
-        _restore_passlayers(model, a_dropped)
-    return model
+    return _ensure_original_layout(model, stage_info)
 
 
 # ============================================================
@@ -577,6 +673,12 @@ def _device_map_from_arg(device: str):
     return {"": device}
 
 
+def _merge_dtype():
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 # ============================================================
 # verification
 # ============================================================
@@ -666,7 +768,8 @@ def merge_single_adapter(
     # [3] base model
     print("\n[3/6] Loading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
-        effective_base, dtype=torch.float16,
+        effective_base,
+        torch_dtype=_merge_dtype(),
         device_map=_device_map_from_arg(device), trust_remote_code=True,
     )
     n_layers = len(_get_model_layers(base_model))
@@ -745,7 +848,8 @@ def merge_multiple_adapters(
 
     bundle_dirs = _resolve_bundle_dirs_from_manifest(base_model_path)
     current_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path, dtype=torch.float16,
+        base_model_path,
+        torch_dtype=_merge_dtype(),
         device_map=_device_map_from_arg(device), trust_remote_code=True,
     )
     _restore_pruned_a_layout(current_model, stage_info)

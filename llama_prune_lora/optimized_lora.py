@@ -20,13 +20,13 @@ python -m llama_prune_lora.optimized_lora \
 Usage:
 # 13b 실험
 # Stage 1
-CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.optimized_lora \
   --base_dir ./13b_results/pruning/A \
   --bundles_dir ./13b_results/pruning/bundles \
-  --stage 1 --out_adapters ./llama_13b_lora_results/adapters \
+  --stage 1 --out_adapters ./no_llama_13b_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 2048 --lr 3e-4 --epochs 4 --bs 1 --grad_acc 32
+  --seq_len 3096 --lr 3e-4 --epochs 4 --bs 1 --grad_acc 32
 
 # Stage 2 (A_merged 기준)
 CUDA_VISIBLE_DEVICES=4 DEVICE=cuda:0 \
