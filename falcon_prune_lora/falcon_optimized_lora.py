@@ -69,7 +69,7 @@ python -m falcon_prune_lora.falcon_optimized_lora \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 """
 
-import os, sys, json, re, argparse
+import os, sys, json, re, argparse, random
 from datetime import datetime
 from typing import List
 import torch, torch.nn as nn
@@ -80,6 +80,11 @@ from transformers import (
 )
 from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
@@ -120,6 +125,15 @@ def _layer_prefix(model, i):
     if isinstance(model, PeftModel):
         return f"base_model.model.transformer.h.{i}."
     return f"transformer.h.{i}."
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 # ============================================================
@@ -300,11 +314,11 @@ def _build_msgs(ctx, q, ds_name):
              f"Answer the question using the context.\n\nContext:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"}]
 
 
-def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len):
+def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len, seed=42):
     DS_MAP = {"squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2"}
     ds = load_dataset(DS_MAP.get(ds_name, ds_name), split=split)
     if max_samples:
-        ds = ds.shuffle(seed=42).select(range(min(max_samples, len(ds))))
+        ds = ds.shuffle(seed=seed).select(range(min(max_samples, len(ds))))
 
     pad_id = tok.pad_token_id or tok.eos_token_id
     eos_id = tok.eos_token_id
@@ -414,10 +428,11 @@ def _write_readme(out_dir, args, adapter_name, start_time):
 | batch_size | {args.bs} |
 | grad_acc | {args.grad_acc} |
 | seq_len | {args.seq_len} |
-| warmup_ratio | {args.warmup_ratio} |
-| max_grad_norm | {args.max_grad_norm} |
-| dataset | {args.qa_dataset} |
-| max_samples | {args.max_samples} |
+  | warmup_ratio | {args.warmup_ratio} |
+  | max_grad_norm | {args.max_grad_norm} |
+  | dataset | {args.qa_dataset} |
+  | max_samples | {args.max_samples} |
+  | seed | {args.seed} |
 
 ## Paths
 - base_dir: `{args.base_dir}`
@@ -456,6 +471,8 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         logging_steps=args.logging_steps, logging_first_step=True,
         remove_unused_columns=False,
         report_to="none",
+        seed=args.seed,
+        data_seed=args.seed,
         save_total_limit=args.save_total_limit,
     )
 
@@ -512,11 +529,13 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--save_total_limit", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    _set_seed(args.seed)
 
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
@@ -557,10 +576,22 @@ def main():
 
     # Datasets
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train",
-                                args.max_samples, args.seq_len)
-    eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation",
-                               args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_dataset(
+        tok,
+        args.qa_dataset,
+        "train",
+        args.max_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
+    eval_ds = _load_qa_dataset(
+        tok,
+        args.qa_dataset,
+        "validation",
+        args.max_eval_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
     # ================================================================

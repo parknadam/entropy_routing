@@ -4,16 +4,16 @@
 #
 # Usage (텍스트 파일로 평가; 가장 안정적)
 """
-CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_eval_ppl \
      --base_model ./falcon_results/pruning/A \
      --bundles_dir ./falcon_results/pruning/bundles \
      --text_file ./data/wikitext2_test.txt \
      --seqlen 1024 --batch_size 1 --max_batches 64 \
      --dtype bf16 \
-     --lora_A   ./falcon_kd_lora_results/adapters/A_lora/stageA/stageA \
-     --lora_AB  ./falcon_kd_lora_results/adapters/B_lora/stageB \
-     --lora_FULL ./falcon_kd_lora_results/adapters/C_lora/stageC
+     --lora_A   ./2048_falcon_lora_results/adapters/A_lora/stageA/stageA \
+     --lora_AB  ./2048_falcon_lora_results/adapters/B_lora/stageB/stageB \
+     --lora_FULL ./2048_falcon_lora_results/adapters/C_lora/stageC/stageC
 """
 
 from __future__ import annotations
@@ -466,6 +466,48 @@ def _iter_textfile_batches(
     return _pack_text_lines_to_batches(_lines(), tok, seqlen, batch_size, device, max_batches)
 
 
+def _extract_input_ids_tensor(obj: Any) -> Optional[torch.Tensor]:
+    """BatchEncoding / TokenizerWrapper 같은 객체에서 input_ids 텐서를 꺼냅니다."""
+    if isinstance(obj, dict) and "input_ids" in obj:
+        val = obj["input_ids"]
+        if torch.is_tensor(val):
+            return val
+    if hasattr(obj, "input_ids"):
+        val = getattr(obj, "input_ids", None)
+        if torch.is_tensor(val):
+            return val
+    return None
+
+
+def _tensor_to_batches_iter(
+    ids: torch.Tensor,
+    seqlen: int,
+    batch_size: int,
+    device: str,
+    max_batches: Optional[int],
+) -> Iterator[Dict[str, torch.Tensor]]:
+    if ids.dim() == 2:
+        ids = ids[0]
+    ids = ids.long()
+
+    def _gen():
+        made = 0
+        cur: List[torch.Tensor] = []
+        total = ids.numel()
+        for start in range(0, total - seqlen + 1, seqlen):
+            cur.append(ids[start : start + seqlen].clone())
+            if len(cur) == batch_size:
+                x = torch.stack(cur, dim=0).to(device)
+                attn = torch.ones_like(x, dtype=torch.long)
+                yield {"input_ids": x, "attention_mask": attn}
+                cur = []
+                made += 1
+                if max_batches is not None and made >= max_batches:
+                    return
+
+    return _gen()
+
+
 def _normalize_loader_to_batches(
     raw_loader: Any,
     tok: AutoTokenizer,
@@ -474,6 +516,10 @@ def _normalize_loader_to_batches(
     device: str,
     max_batches: Optional[int],
 ) -> Iterator[Dict[str, torch.Tensor]]:
+    ids_tensor = _extract_input_ids_tensor(raw_loader)
+    if ids_tensor is not None:
+        return _tensor_to_batches_iter(ids_tensor, seqlen, batch_size, device, max_batches)
+
     if isinstance(raw_loader, str):
         return _pack_text_lines_to_batches(iter([raw_loader]), tok, seqlen, batch_size, device, max_batches)
 
@@ -481,26 +527,7 @@ def _normalize_loader_to_batches(
         return _pack_text_lines_to_batches(iter(raw_loader), tok, seqlen, batch_size, device, max_batches)
 
     if torch.is_tensor(raw_loader):
-        ids = raw_loader
-        if ids.dim() == 2:
-            ids = ids[0]
-
-        def _gen():
-            made = 0
-            cur: List[torch.Tensor] = []
-            total = ids.numel()
-            for start in range(0, total - seqlen + 1, seqlen):
-                cur.append(ids[start : start + seqlen].clone().long())
-                if len(cur) == batch_size:
-                    x = torch.stack(cur, dim=0).to(device)
-                    attn = torch.ones_like(x, dtype=torch.long)
-                    yield {"input_ids": x, "attention_mask": attn}
-                    cur = []
-                    made += 1
-                    if max_batches is not None and made >= max_batches:
-                        return
-
-        return _gen()
+        return _tensor_to_batches_iter(raw_loader, seqlen, batch_size, device, max_batches)
 
     it = iter(raw_loader)
 
@@ -560,20 +587,26 @@ def eval_ppl(model, loader: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, floa
         if labels is not None:
             if labels.dim() != 2:
                 labels = _ensure_2d(labels)
+            if input_ids.shape[1] < 2:
+                continue
+
             labels = labels.clone()
             labels[attn == 0] = -100
 
             out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-            logits = out.logits
-            V = logits.size(-1)
+            shift_logits = out.logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            shift_mask = attn[:, 1:].contiguous()
+            shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
+            V = shift_logits.size(-1)
 
             loss_sum = F.cross_entropy(
-                logits.float().view(-1, V),
-                labels.view(-1),
+                shift_logits.float().view(-1, V),
+                shift_labels.view(-1),
                 ignore_index=-100,
                 reduction="sum",
             )
-            tok_cnt = (labels != -100).sum().item()
+            tok_cnt = (shift_labels != -100).sum().item()
             sum_nll += float(loss_sum.item())
             sum_tok += int(tok_cnt)
             continue

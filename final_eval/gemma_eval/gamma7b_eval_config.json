@@ -1,0 +1,32 @@
+{
+  "original_model_dir": "google/gemma-7b",
+  "original_N": 28,
+
+  "A_dir": "./gemma_7b_results/pruning/A",
+  "A_merged_dir": "./merged_models_gemma_7b/A_merged",
+
+  "B_bundle_dir": "./gemma_7b_results/pruning/bundles/B",
+  "B_merged_dir": "./merged_models_gemma_7b/B_merged",
+
+  "C_bundle_dir": "./gemma_7b_results/pruning/bundles/C",
+  "C_merged_dir": "./merged_models_gemma_7b/C_merged",
+
+  "final_merged_dir": null,
+
+  "B_indices": [],
+  "C_indices": [],
+
+  "eval": {
+    "seq_len": 2048,
+    "ppl_stride": 512,
+    "zero_shot_tasks": [
+      "arc_easy", "arc_challenge", "hellaswag",
+      "winogrande", "piqa", "boolq", "openbookqa"
+    ],
+    "system_prompt_lengths": [128, 512, 1024],
+    "system_gen_tokens": 128,
+    "system_n_warmup": 3,
+    "system_n_repeat": 10,
+    "batch_size": "auto"
+  }
+}

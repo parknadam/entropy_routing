@@ -8,13 +8,13 @@ an explicit FULL(ABC) stage for training a LoRA adapter on the entire 7B model.
 Two common modes:
 
 1) Full HF base model -> attach LoRA to all layers directly
-CUDA_VISIBLE_DEVICES=0 DEVICE=cuda:0 \
+CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
 python -m llama_prune_lora.full_lora \
-  --base_dir /acpl-ssd32/llama2-7b/baseline_full_single \
+  --base_dir /acpl-ssd32/llama2-13b/baseline_full_single \
   --stage 3 \
   --out_adapters ./no_2048_fullmodel_lora_results/adapters \
   --qa_dataset squad --max_samples 20000 --max_eval_samples 8000 \
-  --seq_len 3096 --lr 3e-4 --epochs 2 --bs 1 --grad_acc 32
+  --seq_len 4096 --lr 3e-4 --epochs 2 --bs 2 --grad_acc 32
 
 2) Pruned A model + bundles -> restore B/C and train FULL(ABC)
 CUDA_VISIBLE_DEVICES=6 DEVICE=cuda:0 \
@@ -35,10 +35,16 @@ Optional split-aware stages:
 import argparse
 import json
 import os
+import random
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     from .total_optimized_lora import (
@@ -84,6 +90,15 @@ def _stage_arg(raw):
     return mapping[stage]
 
 
+def _set_seed(seed: int):
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--base_dir", required=True)
@@ -112,6 +127,7 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--save_total_limit", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
@@ -163,6 +179,7 @@ def _load_layout_info(base_dir, bundles_dir=None):
 
 def main():
     args = parse_args()
+    _set_seed(args.seed)
 
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
     if not tok.pad_token:
@@ -217,8 +234,15 @@ def main():
     layers = _layers(model)
 
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len)
-    eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len, seed=args.seed)
+    eval_ds = _load_qa_dataset(
+        tok,
+        args.qa_dataset,
+        "validation",
+        args.max_eval_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
     if args.stage == "A":

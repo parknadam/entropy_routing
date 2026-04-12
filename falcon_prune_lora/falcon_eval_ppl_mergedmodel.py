@@ -13,6 +13,7 @@ python -m falcon_prune_lora.falcon_eval_ppl_mergedmodel \
   --device cuda:0
 
 # A / AB / FULL stage 비교 (머지된 B/C 번들 사용)
+CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
 python -m falcon_prune_lora.falcon_eval_ppl_mergedmodel \
   --model_path ./merged_2048loraresults_falcon7b/A_merged \
   --b_bundle ./merged_2048loraresults_falcon7b/B_merged \
@@ -570,16 +571,23 @@ def eval_ppl(model, batches: List[Dict[str, torch.Tensor]]) -> Dict[str, float]:
         if labels is not None:
             if labels.dim() != 2:
                 labels = _ensure_2d(labels)
+            if input_ids.shape[1] < 2:
+                continue
+
             labels = labels.clone()
             labels[attn == 0] = -100
             out = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
-            V = out.logits.size(-1)
+            shift_logits = out.logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            shift_mask = attn[:, 1:].contiguous()
+            shift_labels = shift_labels.masked_fill(shift_mask == 0, -100)
+            V = shift_logits.size(-1)
             loss_sum = F.cross_entropy(
-                out.logits.float().view(-1, V), labels.view(-1),
+                shift_logits.float().view(-1, V), shift_labels.view(-1),
                 ignore_index=-100, reduction="sum",
             )
             sum_nll += float(loss_sum.item())
-            sum_tok += int((labels != -100).sum().item())
+            sum_tok += int((shift_labels != -100).sum().item())
             continue
 
         if input_ids.shape[1] < 2:

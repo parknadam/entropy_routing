@@ -21,6 +21,7 @@ import argparse
 import inspect
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -55,6 +56,11 @@ except ImportError:
         )
     except ImportError:
         _shared_detect_layer_return_tuple = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 
 def detect_layer_return_tuple(model) -> bool:
@@ -91,6 +97,15 @@ def detect_layer_return_tuple(model) -> bool:
 KST = timezone(timedelta(hours=9))
 CANON_PATH = "model.layers"
 _BUNDLE_LAYER_FILE_RE = re.compile(r"^layer_(\d+)\.safetensors$")
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class EpochSaveCallback(TrainerCallback):
@@ -176,6 +191,7 @@ def _write_readme(out_dir, start_time, end_time=None, args=None, extra=None):
         lines.append(f"- **Stage**: {args.stage}")
         lines.append(f"- **LR**: {args.lr}, **Epochs**: {args.epochs}, **BS**: {args.bs}x{args.grad_acc}")
         lines.append(f"- **Seq len**: {args.seq_len}, **Dataset**: {args.qa_dataset}")
+        lines.append(f"- **Seed**: {args.seed}")
     if extra:
         for key, value in extra.items():
             lines.append(f"- **{key}**: {value}")
@@ -465,11 +481,11 @@ def _build_msgs(context, question, dataset_name):
     ]
 
 
-def _load_qa_dataset(tokenizer, dataset_name, split, max_samples, seq_len):
+def _load_qa_dataset(tokenizer, dataset_name, split, max_samples, seq_len, seed=42):
     dataset_map = {"squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2"}
     dataset = load_dataset(dataset_map.get(dataset_name, dataset_name), split=split)
     if max_samples:
-        dataset = dataset.shuffle(seed=42).select(range(min(max_samples, len(dataset))))
+        dataset = dataset.shuffle(seed=seed).select(range(min(max_samples, len(dataset))))
 
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     eos_id = tokenizer.eos_token_id
@@ -608,6 +624,8 @@ def train_adapter(model, tokenizer, out_dir, train_ds, eval_ds, args, adapter_na
         logging_first_step=True,
         remove_unused_columns=False,
         report_to="none",
+        seed=args.seed,
+        data_seed=args.seed,
         save_total_limit=args.save_total_limit,
     )
     try:
@@ -673,11 +691,13 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=200)
     parser.add_argument("--save_steps", type=int, default=0)
     parser.add_argument("--save_total_limit", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    _set_seed(args.seed)
     start_time = time.time()
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
@@ -718,8 +738,22 @@ def main():
     layers = _layers(model)
 
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_dataset(tokenizer, args.qa_dataset, "train", args.max_samples, args.seq_len)
-    eval_ds = _load_qa_dataset(tokenizer, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_dataset(
+        tokenizer,
+        args.qa_dataset,
+        "train",
+        args.max_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
+    eval_ds = _load_qa_dataset(
+        tokenizer,
+        args.qa_dataset,
+        "validation",
+        args.max_eval_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
     readme_extra = {

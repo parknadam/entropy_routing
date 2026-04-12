@@ -1,0 +1,84 @@
+{
+  "name": "template-multi-model-suite",
+  "defaults": {
+    "cwd": "{repo_root}",
+    "env": {
+      "PYTHONUNBUFFERED": "1",
+      "TOKENIZERS_PARALLELISM": "false",
+      "DEVICE": "cuda:0"
+    },
+    "repeats": 5,
+    "seed_start": 0,
+    "vars": {
+      "python_bin": "{repo_root}/.venv/bin/python"
+    }
+  },
+  "models": {
+    "llama7b": {
+      "vars": {
+        "model_path": "/acpl-ssd32/llama2-7b/final_merged",
+        "vllm_port": "8101",
+        "artifact_root": "{run_root}/artifacts/llama7b"
+      }
+    },
+    "llama13b": {
+      "vars": {
+        "model_path": "/acpl-ssd32/llama2-13b/final_merged",
+        "artifact_root": "{run_root}/artifacts/llama13b"
+      }
+    },
+    "falcon7b": {
+      "vars": {
+        "model_path": "/acpl-ssd32/falcon-7b/final_merged",
+        "artifact_root": "{run_root}/artifacts/falcon7b"
+      }
+    },
+    "gemma7b": {
+      "vars": {
+        "model_path": "/acpl-ssd32/gemma-7b/final_merged",
+        "artifact_root": "{run_root}/artifacts/gemma7b"
+      }
+    }
+  },
+  "servers": {
+    "llama7b_vllm": {
+      "cwd": "{repo_root}",
+      "start_command": "source .venv/bin/activate && python -m vllm.entrypoints.openai.api_server --model {model_path} --port {vllm_port}",
+      "healthcheck_url": "http://127.0.0.1:{vllm_port}/health",
+      "startup_timeout_sec": 600
+    }
+  },
+  "experiments": [
+    {
+      "id": "exp1_local_command",
+      "models": [
+        "llama7b",
+        "llama13b",
+        "falcon7b",
+        "gemma7b"
+      ],
+      "command": "mkdir -p {artifact_root}/exp1/seed_{seed} && echo \"replace this with experiment 1\" > {artifact_root}/exp1/seed_{seed}/done.txt",
+      "done_file": "{artifact_root}/exp1/seed_{seed}/done.txt"
+    },
+    {
+      "id": "exp2_local_command",
+      "models": [
+        "llama7b",
+        "llama13b",
+        "falcon7b",
+        "gemma7b"
+      ],
+      "command": "mkdir -p {artifact_root}/exp2/seed_{seed} && echo \"replace this with experiment 2\" > {artifact_root}/exp2/seed_{seed}/done.txt",
+      "done_file": "{artifact_root}/exp2/seed_{seed}/done.txt"
+    },
+    {
+      "id": "exp3_vllm_or_client_command",
+      "models": [
+        "llama7b"
+      ],
+      "server": "llama7b_vllm",
+      "command": "mkdir -p {artifact_root}/exp3/seed_{seed} && echo \"replace this with your vLLM-backed client benchmark\" > {artifact_root}/exp3/seed_{seed}/done.txt",
+      "done_file": "{artifact_root}/exp3/seed_{seed}/done.txt"
+    }
+  ]
+}

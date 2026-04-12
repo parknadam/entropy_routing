@@ -54,7 +54,7 @@ python -m llama_prune_lora.optimized_kd_lora \
   --kd_alpha 0.1 --kd_T 2.0
 """
 
-import os, json, re, math, inspect
+import os, json, re, math, inspect, random
 from typing import List, Tuple
 import torch
 import torch.nn as nn
@@ -68,10 +68,24 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 # ============================================================
 # 레이어 관리
 # ============================================================
 CANON_PATH = "model.layers"
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _resolve_attr_path(root, dotted: str):
@@ -354,11 +368,11 @@ def _build_chat_messages(ctx: str, q: str, dataset: str):
     ]
 
 
-def _load_qa_sft_dataset(tokenizer, qa_dataset, split, max_samples, seq_len):
+def _load_qa_sft_dataset(tokenizer, qa_dataset, split, max_samples, seq_len, seed=42):
     DATASET_MAP = {"squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2"}
     ds = load_dataset(DATASET_MAP.get(qa_dataset, qa_dataset), split=split)
     if max_samples:
-        ds = ds.shuffle(seed=42).select(range(min(max_samples, len(ds))))
+        ds = ds.shuffle(seed=seed).select(range(min(max_samples, len(ds))))
 
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     eos_id = tokenizer.eos_token_id
@@ -501,6 +515,7 @@ def train_adapter(model, out_dir, train_ds, eval_ds, args, adapter_name,
         logging_steps=args.logging_steps, logging_first_step=True,
         max_grad_norm=args.max_grad_norm, warmup_ratio=args.warmup_ratio,
         remove_unused_columns=False, report_to="none",
+        seed=args.seed, data_seed=args.seed,
         save_total_limit=args.save_total_limit)
     dtype_map = {"bf16": {"bf16": True, "fp16": False}, "fp16": {"fp16": True, "bf16": False}}
     common.update(dtype_map.get(args.dtype, {}))
@@ -585,6 +600,7 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--save_total_limit", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
 
     p.add_argument("--use_kd", action="store_true")
     p.add_argument("--teacher_model", default="meta-llama/Llama-2-7b-chat-hf")
@@ -640,6 +656,7 @@ def _load_index_info(base_dir: str, bundles_dir: str, stage: int,
 
 def main():
     args = parse_args()
+    _set_seed(args.seed)
 
     # ── Tokenizer ──
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
@@ -688,8 +705,22 @@ def main():
 
     # ── Datasets ──
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_sft_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len)
-    eval_ds = _load_qa_sft_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_sft_dataset(
+        tok,
+        args.qa_dataset,
+        "train",
+        args.max_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
+    eval_ds = _load_qa_sft_dataset(
+        tok,
+        args.qa_dataset,
+        "validation",
+        args.max_eval_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
 
     # ── Teacher ──
     teacher = load_teacher(args)

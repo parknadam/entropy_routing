@@ -219,5 +219,7 @@ phi3_small_results/
 
 eval_results/
 
-deepseek_a_direct_output.json
-phi3small_progressive_sanity_20260330.json
+suite_runs/
+
+eval_code/
+eval_results/

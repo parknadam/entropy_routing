@@ -38,9 +38,10 @@ python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --device cuda:0
 
 # C merge (bundle-only auto detection)
+CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
 python -m falcon_prune_lora.pruning.falcon_merge_adapter \
   --base_model ./falcon_results/pruning/bundles/C \
-  --adapter_path ./2048_falcon_lora_results/adapters/C_lora/stageC \
+  --adapter_path ./2048_falcon_lora_results/adapters/C_lora/stageC/stageC \
   --output_dir ./merged_2048loraresults_falcon7b/C_merged \
   --device cuda:0
 """

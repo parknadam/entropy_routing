@@ -46,7 +46,7 @@ python -m llama_prune_lora.total_optimized_lora \
   --seq_len 1024 --lr 3e-5 --epochs 1 --bs 1 --grad_acc 32
 """
 
-import os, json, re, inspect, argparse
+import os, json, re, inspect, argparse, random
 from typing import List
 import torch, torch.nn as nn
 from datasets import load_dataset
@@ -58,10 +58,24 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from safetensors.torch import load_file
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
 # ============================================================
 # Layer utilities
 # ============================================================
 CANON_PATH = "model.layers"
+
+
+def _set_seed(seed: int):
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _resolve(root, dotted):
@@ -294,11 +308,11 @@ def _build_msgs(ctx, q, ds_name):
             {"role": "user", "content": f"Answer the question using the context.\n\nContext:\n{ctx}\n\nQuestion:\n{q}\n\nAnswer:"}]
 
 
-def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len):
+def _load_qa_dataset(tok, ds_name, split, max_samples, seq_len, seed=42):
     DS_MAP = {"squad": "rajpurkar/squad", "squad_v2": "rajpurkar/squad_v2"}
     ds = load_dataset(DS_MAP.get(ds_name, ds_name), split=split)
     if max_samples:
-        ds = ds.shuffle(seed=42).select(range(min(max_samples, len(ds))))
+        ds = ds.shuffle(seed=seed).select(range(min(max_samples, len(ds))))
 
     pad_id = tok.pad_token_id or tok.eos_token_id
     eos_id = tok.eos_token_id
@@ -433,6 +447,8 @@ def train_adapter(model, tok, out_dir, train_ds, eval_ds, args, adapter_name):
         logging_first_step=True,
         remove_unused_columns=False,
         report_to="none",
+        seed=args.seed,
+        data_seed=args.seed,
         save_total_limit=args.save_total_limit,
         save_strategy="epoch",                # ← 매 epoch마다 저장
     )
@@ -489,11 +505,13 @@ def parse_args():
     p.add_argument("--eval_steps", type=int, default=200)
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--save_total_limit", type=int, default=2)
+    p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    _set_seed(args.seed)
 
     # Tokenizer
     tok = AutoTokenizer.from_pretrained(args.base_dir, use_fast=True, local_files_only=True)
@@ -540,8 +558,15 @@ def main():
 
     # Datasets
     print("\n[Loading] Datasets")
-    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len)
-    eval_ds = _load_qa_dataset(tok, args.qa_dataset, "validation", args.max_eval_samples, args.seq_len)
+    train_ds = _load_qa_dataset(tok, args.qa_dataset, "train", args.max_samples, args.seq_len, seed=args.seed)
+    eval_ds = _load_qa_dataset(
+        tok,
+        args.qa_dataset,
+        "validation",
+        args.max_eval_samples,
+        args.seq_len,
+        seed=args.seed,
+    )
     print(f"  train={len(train_ds)}, eval={len(eval_ds)}")
 
     # ================================================================

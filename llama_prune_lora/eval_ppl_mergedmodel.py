@@ -12,12 +12,21 @@ python -m llama_prune_lora.eval_ppl_mergedmodel \
   --model_path ./merged_models_llama_7b/A_merged \
   --device cuda:0
 
-# A / AB / FULL stage 비교 (머지된 B/C 번들 사용)
-CUDA_VISIBLE_DEVICES=2 DEVICE=cuda:0 \
+# 13b - A / AB / FULL stage 비교 (머지된 B/C 번들 사용)
+CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 \
 python -m llama_prune_lora.eval_ppl_mergedmodel \
   --model_path ./merged_models_llama_13b_lora/A_merged \
   --b_bundle ./merged_models_llama_13b_lora/B_merged \
   --c_bundle ./merged_models_llama_13b_lora/C_merged \
+  --stages A,AB,FULL \
+  --device cuda:0
+
+# 7b
+CUDA_VISIBLE_DEVICES=1 DEVICE=cuda:0 \
+python -m llama_prune_lora.eval_ppl_mergedmodel \
+  --model_path ./merged_2048loraresults_llama7b/A_merged \
+  --b_bundle ./merged_2048loraresults_llama7b/B_merged \
+  --c_bundle ./merged_2048loraresults_llama7b/C_merged \
   --stages A,AB,FULL \
   --device cuda:0
 
