@@ -206,16 +206,13 @@ mistral_kd_lora_results/
 *.bin
 *.safetensors
 checkpoint-*/
-<<<<<<< HEAD
 
 adapters/
 
 modified_falcon_kd_lora_results/
-=======
 lora_results/
 new_falcon_kd_lora_results/
 phi3_small_results/
->>>>>>> ea86042 (수정)
 
 eval_results/
 
@@ -230,3 +227,4 @@ not_using_code/
 KD_LoRA_optimization_guide.md
 gemma_7b_merged_model/
 phi_prune_lora/
+phi_prune_lora/pruning
