@@ -219,7 +219,11 @@ phi3_small_results/
 
 eval_results/
 
+suite/
 suite_runs/
 
 eval_code/
 eval_results/
+
+eval_a/
+not_using_code/
