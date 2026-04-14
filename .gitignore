@@ -226,5 +226,6 @@ eval_a/
 not_using_code/
 KD_LoRA_optimization_guide.md
 gemma_7b_merged_model/
+gemma_7b_results/
 phi_prune_lora/
 phi_prune_lora/pruning

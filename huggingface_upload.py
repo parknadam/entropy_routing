@@ -1,3 +1,6 @@
+"""
+CUDA_VISIBLE_DEVICES=3 \ python huggingface_upload.py
+"""
 import os
 from pathlib import Path
 from huggingface_hub import HfApi, create_repo
@@ -5,10 +8,10 @@ from huggingface_hub import HfApi, create_repo
 # =========================
 # 설정
 # =========================
-LOCAL_ADAPTER_DIR = "/workspace/entropy_routing/modified_falcon_kd_lora_results/adapters"
-REPO_ID = "dddreamerrr/falcon-7b-total-kd-lora"   
+LOCAL_ADAPTER_DIR = "/home/devewha/entropy_routing/merged_2048loraresults_llama7b"
+REPO_ID = "dddreamerrr/llama_7b_mergedmodel"   
 PRIVATE = False
-COMMIT_MESSAGE = "Upload PEFT adapter folder"
+COMMIT_MESSAGE = "Upload llama7b 2048 merged model folder"
 
 # HF 토큰: 미리 환경변수로 넣어두는 걸 권장
 # export HF_TOKEN=hf_xxx

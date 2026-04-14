@@ -2,31 +2,28 @@
   "original_model_dir": "meta-llama/Llama-2-13b-chat-hf",
   "original_N": 40,
 
-  "A_dir": "./13b_results/pruning/A",
   "A_merged_dir": "./merged_models_llama_13b_lora/A_merged",
-
-  "B_bundle_dir": "./13b_results/pruning/bundles/B",
+  
+  "B_bundle_dir": "./7b_results/pruning/bundles/B",
   "B_merged_dir": "./merged_models_llama_13b_lora/B_merged",
-
-  "C_bundle_dir": "./13b_results/pruning/bundles/C",
+  
+  "C_bundle_dir": "./7b_results/pruning/bundles/C",
   "C_merged_dir": "./merged_models_llama_13b_lora/C_merged",
-
+  
   "final_merged_dir": null,
-
   "B_indices": [],
   "C_indices": [],
-
+  "_indices_note": "비어있으면 bundle_meta.json에서 자동 탐지",
   "eval": {
+    "dtype": "bfloat16",
+    "seed": 42,
     "seq_len": 2048,
     "ppl_stride": 512,
+    "num_fewshot": 0,
     "zero_shot_tasks": [
       "arc_easy", "arc_challenge", "hellaswag",
       "winogrande", "piqa", "boolq", "openbookqa"
     ],
-    "system_prompt_lengths": [128, 512, 1024],
-    "system_gen_tokens": 128,
-    "system_n_warmup": 3,
-    "system_n_repeat": 10,
-    "batch_size": "auto"
+    "batch_size": "2"
   }
 }

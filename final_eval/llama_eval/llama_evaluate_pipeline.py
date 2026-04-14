@@ -14,12 +14,13 @@ Usage:
     --config ./final_eval/llama_eval/llama7b_eval_config.json --output_dir ./eval_results/llama2_7b_2
 
 # llama2-13b
-CUDA_VISIBLE_DEVICES=1 python -m final_eval.llama_eval.llama_evaluate_pipeline \
-    --config ./final_eval/llama_eval/llama7b_eval_config.json --output_dir ./eval_results/llama2_7b
+CUDA_VISIBLE_DEVICES=5 python -m final_eval.llama_eval.llama_evaluate_pipeline \
+    --config ./final_eval/llama_eval/llama13b_eval_config.json --output_dir ./eval_results/llama2_13b
 
 """
 
-import os, sys, json, re, time, inspect, argparse, gc
+
+import os, sys, json, re, inspect, argparse, gc, platform
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -34,6 +35,89 @@ from datasets import load_dataset
 
 KST = timezone(timedelta(hours=9))
 CANON_PATH = "model.layers"
+
+# ════════════════════════════════════════════════════════════════
+# Environment info collector
+# ════════════════════════════════════════════════════════════════
+
+def collect_env_info(dtype_str: str) -> dict:
+    """Collect reproducibility-critical environment information."""
+    info = {
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda if torch.cuda.is_available() else None,
+        "cudnn_version": str(torch.backends.cudnn.version()) if torch.cuda.is_available() else None,
+        "transformers_version": None,
+        "peft_version": None,
+        "lm_eval_version": None,
+        "gpu_name": None,
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        "gpu_memory_gb": None,
+        "dtype": dtype_str,
+        "os": f"{platform.system()} {platform.release()}",
+        "timestamp": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+    }
+    try:
+        import transformers
+        info["transformers_version"] = transformers.__version__
+    except ImportError:
+        pass
+    try:
+        import peft
+        info["peft_version"] = peft.__version__
+    except ImportError:
+        pass
+    try:
+        import lm_eval
+        info["lm_eval_version"] = getattr(lm_eval, "__version__", "unknown")
+    except ImportError:
+        pass
+    if torch.cuda.is_available():
+        info["gpu_name"] = torch.cuda.get_device_name(0)
+        info["gpu_memory_gb"] = round(
+            torch.cuda.get_device_properties(0).total_mem / 1024**3, 1
+        )
+    return info
+
+
+# ════════════════════════════════════════════════════════════════
+# Active parameter / sparsity counter
+# ════════════════════════════════════════════════════════════════
+
+def count_active_params(model) -> dict:
+    """Count active (non-PassLayer) parameters and compute sparsity."""
+    total_params = 0
+    active_params = 0
+    pass_layer_params = 0
+
+    for name, param in model.named_parameters():
+        n = param.numel()
+        total_params += n
+        # PassLayer has no real parameters, but check by module type
+        active_params += n
+
+    # Count PassLayer positions separately by inspecting layers
+    layers = _layers(model)
+    n_pass = 0
+    n_real = 0
+    for i, layer in enumerate(layers):
+        if isinstance(layer, PassLayer):
+            n_pass += 1
+        else:
+            n_real += 1
+
+    # For param count, total_params from named_parameters already excludes
+    # PassLayer weights (PassLayer has zero parameters).
+    # But we need to report what the Dense model's param count would be.
+    return {
+        "active_params": total_params,
+        "active_params_M": round(total_params / 1e6, 2),
+        "n_real_layers": n_real,
+        "n_pass_layers": n_pass,
+        "n_total_layers": len(layers),
+        "layer_sparsity_pct": round(n_pass / len(layers) * 100, 1) if len(layers) > 0 else 0.0,
+    }
+
 
 # ════════════════════════════════════════════════════════════════
 # Layer utilities (from llama_prune_lora.optimized_lora)
@@ -172,9 +256,17 @@ def reset_gpu_stats():
 # Model loaders
 # ════════════════════════════════════════════════════════════════
 
-def _load_base(path, device, dtype):
+def _require_hf_repo_id(path, key="original_model_dir"):
+    repo_id = str(path).strip()
+    if not repo_id:
+        raise ValueError(f"{key} must be a non-empty Hugging Face repo ID")
+    if repo_id.startswith(("./", "../", "/")) or os.path.exists(repo_id):
+        raise ValueError(f"{key} must be a Hugging Face repo ID for Dense baseline, not a local path: {repo_id}")
+    return repo_id
+
+def _load_base(path, device, dtype, local_files_only=True):
     model = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=dtype, device_map=None, local_files_only=True)
+        path, torch_dtype=dtype, device_map=None, local_files_only=local_files_only)
     model.to(device)
     model.config.use_cache = True
     model.eval()
@@ -211,7 +303,8 @@ def load_stage3(cfg, device, dtype):
 
 def load_dense(cfg, device, dtype):
     """Dense baseline"""
-    return _load_base(cfg["original_model_dir"], device, dtype)
+    repo_id = _require_hf_repo_id(cfg["original_model_dir"])
+    return _load_base(repo_id, device, dtype, local_files_only=False)
 
 MAIN_LOADERS = {
     "Stage1": load_stage1,
@@ -225,7 +318,11 @@ MAIN_LOADERS = {
 # ════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate_perplexity(model, tokenizer, max_seq_len=2048, stride=512):
+def evaluate_perplexity(model, tokenizer, max_seq_len=2048, stride=512, seed=42):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(ds["text"])
     input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
@@ -248,201 +345,156 @@ def evaluate_perplexity(model, tokenizer, max_seq_len=2048, stride=512):
 
     model.config.use_cache = orig_use_cache
     ppl = float(np.exp(sum(nlls) / n_tokens))
-    return {"perplexity": round(ppl, 2), "n_tokens": n_tokens}
+    return {
+        "perplexity": round(ppl, 2),
+        "n_tokens": n_tokens,
+        "max_seq_len": max_seq_len,
+        "stride": stride,
+        "dataset": "wikitext-2-raw-v1",
+        "seed": seed,
+    }
 
 # ════════════════════════════════════════════════════════════════
 # 2. Zero-shot (lm-evaluation-harness, 0-shot)
 # ════════════════════════════════════════════════════════════════
 
-def evaluate_zero_shot(model, tokenizer, tasks=None, batch_size="auto"):
+def evaluate_zero_shot(model, tokenizer, tasks=None, batch_size="auto",
+                       num_fewshot=0, seed=42):
     try:
         import lm_eval
         from lm_eval.models.huggingface import HFLM
     except ImportError:
         print("[WARN] lm-eval not installed")
-        return {}
+        return {}, {}
     if tasks is None:
         tasks = ["arc_easy","arc_challenge","hellaswag","winogrande","piqa","boolq","openbookqa"]
+
     lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
-    results = lm_eval.simple_evaluate(model=lm, tasks=tasks, num_fewshot=0,
-                                       batch_size=batch_size, log_samples=False)
+    results = lm_eval.simple_evaluate(
+        model=lm, tasks=tasks, num_fewshot=num_fewshot,
+        batch_size=batch_size, log_samples=False,
+        random_seed=seed, numpy_random_seed=seed, torch_random_seed=seed,
+    )
+
+    # ── Parsed summary (acc + stderr) ──
     parsed = {}
     for t, r in results.get("results", {}).items():
         acc = r.get("acc_norm,none", r.get("acc,none"))
-        if acc is not None: parsed[t] = round(float(acc) * 100, 2)
-    if parsed: parsed["avg"] = round(sum(parsed.values()) / len(parsed), 2)
-    return parsed
-
-# ════════════════════════════════════════════════════════════════
-# 2-b. MMLU (5-shot, lm-evaluation-harness)
-# ════════════════════════════════════════════════════════════════
-
-def evaluate_mmlu(model, tokenizer, batch_size="auto"):
-    """
-    MMLU 5-shot evaluation via lm-evaluation-harness.
-    Deterministic (log-likelihood scoring) → 단일 실행 결과를 논문에 바로 사용 가능.
-    """
-    try:
-        import lm_eval
-        from lm_eval.models.huggingface import HFLM
-    except ImportError:
-        print("[WARN] lm-eval not installed – skipping MMLU")
-        return {}
-    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
-    results = lm_eval.simple_evaluate(
-        model=lm, tasks=["mmlu"], num_fewshot=5,
-        batch_size=batch_size, log_samples=False)
-    parsed = {}
-    for t, r in results.get("results", {}).items():
-        acc = r.get("acc,none", r.get("acc_norm,none"))
+        stderr = r.get("acc_norm_stderr,none", r.get("acc_stderr,none"))
         if acc is not None:
-            parsed[t] = round(float(acc) * 100, 2)
-    # subcategory 평균 → mmlu_avg
-    subs = {k: v for k, v in parsed.items() if k.startswith("mmlu_") and k != "mmlu_avg"}
-    if subs:
-        parsed["mmlu_avg"] = round(sum(subs.values()) / len(subs), 2)
-    elif "mmlu" in parsed:
-        parsed["mmlu_avg"] = parsed["mmlu"]
-    return parsed
+            entry = {"acc": round(float(acc) * 100, 2)}
+            if stderr is not None:
+                entry["stderr"] = round(float(stderr) * 100, 2)
+            parsed[t] = entry
 
-# ════════════════════════════════════════════════════════════════
-# 3. System benchmark
-# ════════════════════════════════════════════════════════════════
+    if parsed:
+        accs = [v["acc"] for v in parsed.values()]
+        parsed["avg"] = {"acc": round(sum(accs) / len(accs), 2)}
 
-@torch.no_grad()
-def measure_ttft(model, input_ids, attention_mask, n_warmup=3, n_repeat=10):
-    for _ in range(n_warmup):
-        model.generate(input_ids=input_ids, attention_mask=attention_mask,
-                       max_new_tokens=1, do_sample=False)
-    if torch.cuda.is_available(): torch.cuda.synchronize()
-    times = []
-    for _ in range(n_repeat):
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        model.generate(input_ids=input_ids, attention_mask=attention_mask,
-                       max_new_tokens=1, do_sample=False)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1000)
-    return float(np.mean(times)), float(np.std(times))
-
-@torch.no_grad()
-def benchmark_system(model, tokenizer, prompt_lengths=[128, 512, 1024],
-                     gen_tokens=128, n_warmup=3, n_repeat=10):
-    device = next(model.parameters()).device
-    results = {}
-
-    total_params = sum(p.numel() for p in model.parameters()) / 1e6
-    try:
-        layers = _layers(model)
-        pass_params = sum(p.numel() for l in layers if isinstance(l, PassLayer) for p in l.parameters())
-        active_params = (sum(p.numel() for p in model.parameters()) - pass_params) / 1e6
-    except:
-        active_params = total_params
-
-    for prompt_len in prompt_lengths:
-        dummy_ids = torch.randint(100, 30000, (1, prompt_len), device=device)
-        attn = torch.ones_like(dummy_ids)
-
-        ttft_mean, ttft_std = measure_ttft(model, dummy_ids, attn, n_warmup, n_repeat)
-
-        for _ in range(n_warmup):
-            model.generate(input_ids=dummy_ids, attention_mask=attn,
-                           max_new_tokens=gen_tokens, do_sample=False)
-
-        gen_times, peak_mems = [], []
-        for _ in range(n_repeat):
-            reset_gpu_stats()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            out = model.generate(input_ids=dummy_ids, attention_mask=attn,
-                                 max_new_tokens=gen_tokens, do_sample=False)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            gen_times.append((time.perf_counter() - t0) * 1000)
-            peak_mems.append(gpu_mem_mb())
-
-        actual_gen = out.shape[1] - prompt_len
-        avg_gen = float(np.mean(gen_times))
-        decode_total = avg_gen - ttft_mean
-        decode_per_tok = decode_total / max(actual_gen - 1, 1)
-        throughput = actual_gen / (avg_gen / 1000)
-
-        results[f"prompt_{prompt_len}"] = {
-            "ttft_ms": round(ttft_mean, 2), "ttft_std_ms": round(ttft_std, 2),
-            "decode_ms_per_token": round(decode_per_tok, 2),
-            "throughput_tok_s": round(throughput, 1),
-            "gen_total_ms": round(avg_gen, 2),
-            "peak_mem_mb": round(max(peak_mems), 1),
-            "actual_gen_tokens": actual_gen,
-        }
-
-    results["model_info"] = {
-        "total_params_M": round(total_params, 1),
-        "active_params_M": round(active_params, 1),
-        "pruning_ratio_pct": round((1 - active_params / total_params) * 100, 1) if total_params > 0 else 0,
+    # ── Raw results for full reproducibility ──
+    raw_meta = {
+        "num_fewshot": num_fewshot,
+        "seed": seed,
+        "tasks": tasks,
+        "lm_eval_version": getattr(lm_eval, "__version__", "unknown"),
     }
-    return results
+    # Include task-level configs from lm-eval if available
+    if "configs" in results:
+        raw_meta["task_configs"] = results["configs"]
+    if "versions" in results:
+        raw_meta["task_versions"] = results["versions"]
+    if "n-shot" in results:
+        raw_meta["n_shot"] = results["n-shot"]
+
+    return parsed, raw_meta
 
 # ════════════════════════════════════════════════════════════════
-# 4. Results aggregation
+# 3. Results aggregation
 # ════════════════════════════════════════════════════════════════
 
-def aggregate_results(all_results, output_dir):
+def aggregate_results(all_results, output_dir, env_info):
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── Include env info at top level ──
+    output = {
+        "env": env_info,
+        "results": all_results,
+    }
+
     json_path = os.path.join(output_dir, "eval_results.json")
     with open(json_path, "w") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
+        json.dump(output, f, indent=2, ensure_ascii=False)
     print(f"\n[saved] {json_path}")
+
+    # ── Also save raw lm-eval metadata per config ──
+    for cfg_name, r in all_results.items():
+        if "zero_shot_raw" in r:
+            raw_path = os.path.join(output_dir, f"lm_eval_raw_{cfg_name}.json")
+            with open(raw_path, "w") as f:
+                json.dump(r["zero_shot_raw"], f, indent=2, ensure_ascii=False)
+            print(f"[saved] {raw_path}")
 
     configs = list(all_results.keys())
 
-    # ── Accuracy table (zero-shot + MMLU) ──
+    # ── Accuracy table (PPL + zero-shot with stderr) ──
     acc_path = os.path.join(output_dir, "accuracy_table.md")
     all_tasks = set()
     for c in configs:
-        all_tasks.update(all_results[c].get("zero_shot", {}).keys())
-    all_tasks.discard("avg")
-    task_list = sorted(all_tasks) + (["avg"] if any("avg" in all_results[c].get("zero_shot", {}) for c in configs) else [])
-
-    has_mmlu = any("mmlu" in all_results[c] for c in configs)
+        all_tasks.update(k for k in all_results[c].get("zero_shot", {}).keys() if k != "avg")
+    task_list = sorted(all_tasks) + (
+        ["avg"] if any("avg" in all_results[c].get("zero_shot", {}) for c in configs) else []
+    )
 
     with open(acc_path, "w") as f:
-        mmlu_col = " MMLU(5) |" if has_mmlu else ""
-        header = "| Config | PPL(↓) |" + "".join(f" {t} |" for t in task_list) + mmlu_col
-        sep = "|--------|--------|" + "".join("--------|" for _ in task_list) + ("--------|" if has_mmlu else "")
+        header = "| Config | PPL(↓) |" + "".join(f" {t} |" for t in task_list)
+        sep = "|--------|--------|" + "".join("--------|" for _ in task_list)
         f.write(header + "\n" + sep + "\n")
         for c in configs:
             r = all_results[c]
             ppl = r.get("perplexity", {}).get("perplexity", "-")
             zs = r.get("zero_shot", {})
-            mmlu_val = r.get("mmlu", {}).get("mmlu_avg", "-") if has_mmlu else ""
-            row = f"| {c} | {ppl} |" + "".join(f" {zs.get(t, '-')} |" for t in task_list)
-            if has_mmlu: row += f" {mmlu_val} |"
+            cells = []
+            for t in task_list:
+                entry = zs.get(t, None)
+                if entry is None:
+                    cells.append("-")
+                elif isinstance(entry, dict):
+                    acc_str = str(entry["acc"])
+                    if "stderr" in entry:
+                        acc_str += f"±{entry['stderr']}"
+                    cells.append(acc_str)
+                else:
+                    cells.append(str(entry))
+            row = f"| {c} | {ppl} |" + "".join(f" {cell} |" for cell in cells)
             f.write(row + "\n")
     print(f"[saved] {acc_path}")
 
-    # ── System table ──
-    sys_path = os.path.join(output_dir, "system_table.md")
-    prompt_keys = sorted(set(k for c in configs for k in all_results[c].get("system", {}) if k.startswith("prompt_")))
-    with open(sys_path, "w") as f:
-        header = "| Config | Active(M) | Prune% |" + "".join(f" TTFT@{pk.split('_')[1]}(ms) | Dec(ms/tok) | Tok/s | Mem(MB) |" for pk in prompt_keys)
-        f.write(header + "\n")
+    # ── Parameter / sparsity table ──
+    param_path = os.path.join(output_dir, "param_table.md")
+    with open(param_path, "w") as f:
+        f.write("| Config | Active Params (M) | Real Layers | Pass Layers | Layer Sparsity (%) |\n")
+        f.write("|--------|-------------------|-------------|-------------|--------------------|\n")
         for c in configs:
-            sr = all_results[c].get("system", {})
-            info = sr.get("model_info", {})
-            row = f"| {c} | {info.get('active_params_M', '-')} | {info.get('pruning_ratio_pct', '-')} |"
-            for pk in prompt_keys:
-                pr = sr.get(pk, {})
-                row += f" {pr.get('ttft_ms', '-')} | {pr.get('decode_ms_per_token', '-')} | {pr.get('throughput_tok_s', '-')} | {pr.get('peak_mem_mb', '-')} |"
-            f.write(row + "\n")
-    print(f"[saved] {sys_path}")
+            p = all_results[c].get("params", {})
+            if not p:
+                f.write(f"| {c} | - | - | - | - |\n")
+                continue
+            f.write(
+                f"| {c} "
+                f"| {p.get('active_params_M', '-')} "
+                f"| {p.get('n_real_layers', '-')} "
+                f"| {p.get('n_pass_layers', '-')} "
+                f"| {p.get('layer_sparsity_pct', '-')} |\n"
+            )
+    print(f"[saved] {param_path}")
 
 # ════════════════════════════════════════════════════════════════
-# 5. Config generator
+# 4. Config generator
 # ════════════════════════════════════════════════════════════════
 
 def generate_sample_config(path):
     sample = {
-        "original_model_dir": "./original_llama2-7b",
+        "original_model_dir": "meta-llama/Llama-2-7b-chat-hf",
         "original_N": 32,
         "A_dir": "./7b_results/pruning/A",
         "A_merged_dir": "./merged_models/A_merged",
@@ -453,16 +505,42 @@ def generate_sample_config(path):
         "final_merged_dir": None,
         "B_indices": [], "C_indices": [],
         "eval": {
-            "seq_len": 2048, "ppl_stride": 512,
-            "zero_shot_tasks": ["arc_easy","arc_challenge","hellaswag","winogrande","piqa","boolq","openbookqa"],
-            "system_prompt_lengths": [128, 512, 1024],
-            "system_gen_tokens": 128, "system_n_warmup": 3, "system_n_repeat": 10,
+            "dtype": "bfloat16",
+            "seed": 42,
+            "seq_len": 2048,
+            "ppl_stride": 512,
+            "num_fewshot": 0,
+            "zero_shot_tasks": [
+                "arc_easy", "arc_challenge", "hellaswag",
+                "winogrande", "piqa", "boolq", "openbookqa"
+            ],
             "batch_size": "auto",
         }
     }
     with open(path, "w") as f:
         json.dump(sample, f, indent=2)
     print(f"[generated] {path}")
+
+# ════════════════════════════════════════════════════════════════
+# Dtype resolver
+# ════════════════════════════════════════════════════════════════
+
+def resolve_dtype(cfg):
+    """Resolve dtype from config. No auto-detection — must be explicit."""
+    dtype_str = cfg.get("eval", {}).get("dtype", None)
+    if dtype_str is None:
+        raise ValueError(
+            "eval.dtype must be explicitly set in config (e.g. 'bfloat16' or 'float16'). "
+            "Auto-detection is disabled for reproducibility."
+        )
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    if dtype_str not in dtype_map:
+        raise ValueError(f"Unknown dtype '{dtype_str}'. Choose from: {list(dtype_map.keys())}")
+    return dtype_map[dtype_str], dtype_str
 
 # ════════════════════════════════════════════════════════════════
 # Main
@@ -474,8 +552,6 @@ def parse_args():
     p.add_argument("--output_dir", default="./eval_results_llama")
     p.add_argument("--only", default=None)
     p.add_argument("--skip_accuracy", action="store_true")
-    p.add_argument("--skip_system", action="store_true")
-    p.add_argument("--skip_mmlu", action="store_true")
     p.add_argument("--gen_config", default=None)
     return p.parse_args()
 
@@ -494,17 +570,35 @@ def main():
 
     config_names = [c.strip() for c in args.only.split(",")] if args.only else list(MAIN_LOADERS.keys())
 
-    device = torch.device(os.environ.get("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    # ── Dtype: explicit from config, no auto-detection ──
+    dtype, dtype_str = resolve_dtype(cfg)
 
-    tok_dir = cfg.get("A_merged_dir") or cfg.get("A_dir") or cfg.get("original_model_dir")
-    tokenizer = AutoTokenizer.from_pretrained(tok_dir, use_fast=True, local_files_only=True)
+    # ── Seed: explicit from config ──
+    eval_cfg = cfg.get("eval", {})
+    seed = eval_cfg.get("seed", 42)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+    # ── Environment info ──
+    env_info = collect_env_info(dtype_str)
+    env_info["seed"] = seed
+    env_info["config_file"] = os.path.abspath(args.config)
+    print(f"\n[ENV] {json.dumps(env_info, indent=2)}\n")
+
+    device = torch.device(os.environ.get("DEVICE", "cuda:0") if torch.cuda.is_available() else "cpu")
+
+    tok_dir = cfg.get("original_model_dir")
+    tokenizer = AutoTokenizer.from_pretrained(tok_dir, use_fast=True, local_files_only=False)
     if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
 
-    eval_cfg = cfg.get("eval", {})
+    tokenizer.padding_side = "left" # gemma와 동일하게 수정
+
+    num_fewshot = eval_cfg.get("num_fewshot", 0)
     all_results = {}
 
-    print(f"\n{'='*70}\n  LLaMA Pipeline Evaluation\n  Configs: {config_names}\n{'='*70}\n")
+    print(f"\n{'='*70}\n  LLaMA Pipeline Evaluation\n  Configs: {config_names}\n  dtype: {dtype_str}  seed: {seed}  num_fewshot: {num_fewshot}\n{'='*70}\n")
 
     for cfg_name in config_names:
         loader = MAIN_LOADERS.get(cfg_name)
@@ -516,38 +610,51 @@ def main():
         model = loader(cfg, device, dtype)
         result = {}
 
+        # ── Parameter count ──
+        print("  [Params] counting active parameters ...")
+        result["params"] = count_active_params(model)
+        print(f"    → {result['params']['active_params_M']}M params, "
+              f"{result['params']['n_real_layers']} real / "
+              f"{result['params']['n_pass_layers']} pass layers "
+              f"({result['params']['layer_sparsity_pct']}% sparsity)")
+
+        # ── Peak memory after load ──
+        result["peak_memory_mb"] = round(gpu_mem_mb(), 1)
+
         if not args.skip_accuracy:
             print("  [PPL] ...")
-            result["perplexity"] = evaluate_perplexity(model, tokenizer,
-                eval_cfg.get("seq_len", 2048), eval_cfg.get("ppl_stride", 512))
+            result["perplexity"] = evaluate_perplexity(
+                model, tokenizer,
+                eval_cfg.get("seq_len", 2048),
+                eval_cfg.get("ppl_stride", 512),
+                seed=seed,
+            )
             print(f"    → {result['perplexity']['perplexity']}")
 
             print("  [Zero-shot] ...")
-            result["zero_shot"] = evaluate_zero_shot(model, tokenizer,
-                eval_cfg.get("zero_shot_tasks"), eval_cfg.get("batch_size", "auto"))
-            for t, v in result["zero_shot"].items(): print(f"    {t}: {v}")
-
-        if not args.skip_mmlu:
-            print("  [MMLU 5-shot] ...")
-            result["mmlu"] = evaluate_mmlu(model, tokenizer,
-                eval_cfg.get("batch_size", "auto"))
-            mmlu_avg = result["mmlu"].get("mmlu_avg", "-")
-            print(f"    → MMLU avg: {mmlu_avg}")
-
-        if not args.skip_system:
-            print("  [System] ...")
-            result["system"] = benchmark_system(model, tokenizer,
-                eval_cfg.get("system_prompt_lengths", [128, 512, 1024]),
-                eval_cfg.get("system_gen_tokens", 128),
-                eval_cfg.get("system_n_warmup", 3), eval_cfg.get("system_n_repeat", 10))
-            info = result["system"].get("model_info", {})
-            print(f"    Active: {info.get('active_params_M')}M ({info.get('pruning_ratio_pct')}%)")
+            parsed, raw_meta = evaluate_zero_shot(
+                model, tokenizer,
+                eval_cfg.get("zero_shot_tasks"),
+                eval_cfg.get("batch_size", "auto"),
+                num_fewshot=num_fewshot,
+                seed=seed,
+            )
+            result["zero_shot"] = parsed
+            result["zero_shot_raw"] = raw_meta
+            for t, v in parsed.items():
+                if isinstance(v, dict):
+                    acc_str = f"{v['acc']}"
+                    if "stderr" in v:
+                        acc_str += f" ± {v['stderr']}"
+                    print(f"    {t}: {acc_str}")
+                else:
+                    print(f"    {t}: {v}")
 
         all_results[cfg_name] = result
         del model; gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    aggregate_results(all_results, args.output_dir)
+    aggregate_results(all_results, args.output_dir, env_info)
     print(f"\n{'='*70}\n  Done! → {args.output_dir}/\n{'='*70}")
 
 if __name__ == "__main__":
