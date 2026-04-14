@@ -26,6 +26,11 @@ from peft import PeftModel
 from datasets import load_dataset
 
 try:
+    from transformers.utils.hub import cached_file
+except Exception:
+    cached_file = None
+
+try:
     from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
 except Exception:
     FalconDecoderLayer = None
@@ -196,20 +201,36 @@ def _load_bundle_indices(bdir):
     return sorted(int(re.match(r"layer_(\d+)", fn).group(1))
                   for fn in os.listdir(bdir) if re.match(r"layer_\d+\.safetensors", fn))
 
-def _rehydrate(model, bdir, indices):
+def _rehydrate(model, bdir, indices, load_trace=None, component="rehydrate"):
     if FalconDecoderLayer is None:
         raise RuntimeError("FalconDecoderLayer import failed")
     layers = _get_layers(model)
     dtype, dev = next(model.parameters()).dtype, next(model.parameters()).device
+    loaded_files = []
     for i in indices:
         try: nl = FalconDecoderLayer(model.config, layer_idx=int(i))
         except TypeError: nl = FalconDecoderLayer(model.config)
         nl = nl.to(device=dev, dtype=dtype)
-        raw = load_file(_pick_file(bdir, int(i)))
+        layer_path = _pick_file(bdir, int(i))
+        loaded_files.append({
+            "kind": "layer_safetensors",
+            "file": os.path.basename(layer_path),
+            "path": os.path.abspath(layer_path),
+            "layer_index": int(i),
+        })
+        raw = load_file(layer_path)
         sd = {k: v.to(device=dev, dtype=dtype) for k, v in _extract_sd(raw, int(i)).items()}
         try: nl.load_state_dict(sd, strict=True)
         except RuntimeError: nl.load_state_dict(sd, strict=False)
         layers[int(i)] = nl
+    _emit_load_trace(load_trace, {
+        "component": component,
+        "loader": "safetensors.torch.load_file",
+        "source": bdir,
+        "resolved_source": _normalize_source_path(bdir),
+        "files": loaded_files,
+        "indices": [int(i) for i in indices],
+    })
 
 # ════════════════════════════════════════════════════════════════
 # GPU utils
@@ -224,6 +245,123 @@ def reset_gpu_stats():
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════
+# Load trace helpers
+# ════════════════════════════════════════════════════════════════
+
+def _normalize_source_path(path):
+    if isinstance(path, str) and os.path.exists(path):
+        return os.path.abspath(path)
+    return path
+
+def _resolve_model_file(source, filename, local_files_only=None):
+    if not source:
+        return None
+    if os.path.isdir(source):
+        candidate = os.path.join(source, filename)
+        return os.path.abspath(candidate) if os.path.isfile(candidate) else None
+    if os.path.isfile(source):
+        return os.path.abspath(source) if os.path.basename(source) == filename else None
+    if cached_file is None:
+        return None
+
+    variants = [
+        {
+            "local_files_only": False if local_files_only is None else local_files_only,
+            "_raise_exceptions_for_gated_repo": False,
+            "_raise_exceptions_for_missing_entries": False,
+            "_raise_exceptions_for_connection_errors": False,
+        },
+        {"local_files_only": False if local_files_only is None else local_files_only},
+        {},
+    ]
+    for kwargs in variants:
+        try:
+            resolved = cached_file(source, filename, **kwargs)
+            if resolved:
+                return resolved
+        except TypeError:
+            continue
+        except Exception:
+            return None
+    return None
+
+def _resolve_weight_shards(source, index_path, local_files_only=None):
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except Exception:
+        return []
+
+    files = []
+    for shard_name in dict.fromkeys(weight_map.values()):
+        shard_path = _resolve_model_file(source, shard_name, local_files_only)
+        if shard_path is None and index_path:
+            shard_path = os.path.abspath(os.path.join(os.path.dirname(index_path), shard_name))
+        files.append({
+            "kind": "weight_shard",
+            "file": shard_name,
+            "path": shard_path,
+        })
+    return files
+
+def _describe_from_pretrained_artifacts(source, local_files_only=None):
+    artifacts = []
+    for kind, filename in [
+        ("config", "config.json"),
+        ("generation_config", "generation_config.json"),
+    ]:
+        resolved = _resolve_model_file(source, filename, local_files_only)
+        if resolved:
+            artifacts.append({
+                "kind": kind,
+                "file": filename,
+                "path": resolved,
+            })
+
+    for index_kind, index_name, weight_name in [
+        ("weights_index", "model.safetensors.index.json", "model.safetensors"),
+        ("weights_index", "pytorch_model.bin.index.json", "pytorch_model.bin"),
+    ]:
+        index_path = _resolve_model_file(source, index_name, local_files_only)
+        if index_path:
+            artifacts.append({
+                "kind": index_kind,
+                "file": index_name,
+                "path": index_path,
+            })
+            artifacts.extend(_resolve_weight_shards(source, index_path, local_files_only))
+            return artifacts
+
+        weight_path = _resolve_model_file(source, weight_name, local_files_only)
+        if weight_path:
+            artifacts.append({
+                "kind": "weights",
+                "file": weight_name,
+                "path": weight_path,
+            })
+            return artifacts
+
+    return artifacts
+
+def _emit_load_trace(load_trace, entry, max_console_files=8):
+    if load_trace is None:
+        return
+
+    load_trace.append(entry)
+    source = entry.get("resolved_source") or entry.get("source")
+    print(f"  [LoadTrace] {entry.get('component', 'model')}: {source}")
+
+    files = entry.get("files", [])
+    for item in files[:max_console_files]:
+        path = item.get("path") or item.get("file")
+        if not path:
+            continue
+        suffix = f" (layer {item['layer_index']})" if "layer_index" in item else ""
+        print(f"    - {item.get('kind', 'file')}: {path}{suffix}")
+    if len(files) > max_console_files:
+        print(f"    - ... {len(files) - max_console_files} more files recorded")
+
+# ════════════════════════════════════════════════════════════════
 # Model loaders
 # ════════════════════════════════════════════════════════════════
 
@@ -235,7 +373,15 @@ def _require_hf_repo_id(path, key="original_model_dir"):
         raise ValueError(f"{key} must be a Hugging Face repo ID for Dense baseline, not a local path: {repo_id}")
     return repo_id
 
-def _load_base(path, device, dtype, local_files_only=None):
+def _load_base(path, device, dtype, local_files_only=None, load_trace=None, component="base_model"):
+    _emit_load_trace(load_trace, {
+        "component": component,
+        "loader": "AutoModelForCausalLM.from_pretrained",
+        "source": path,
+        "resolved_source": _normalize_source_path(path),
+        "local_files_only": local_files_only,
+        "files": _describe_from_pretrained_artifacts(path, local_files_only),
+    })
     load_kwargs = {
         "torch_dtype": dtype,
         "low_cpu_mem_usage": True,
@@ -253,35 +399,53 @@ def _load_base(path, device, dtype, local_files_only=None):
     model.eval()
     return model
 
-def load_stage1(cfg, device, dtype):
-    model = _load_base(cfg["A_merged_dir"], device, dtype)
+def load_stage1(cfg, device, dtype, load_trace=None):
+    model = _load_base(
+        cfg["A_merged_dir"], device, dtype,
+        load_trace=load_trace, component="A_merged_base",
+    )
     removed = sorted(set(cfg["B_indices"] + cfg["C_indices"]))
     model, _ = _ensure_original_layout(model, removed, cfg["original_N"])
     return model
 
-def load_stage2(cfg, device, dtype):
-    model = _load_base(cfg["A_merged_dir"], device, dtype)
+def load_stage2(cfg, device, dtype, load_trace=None):
+    model = _load_base(
+        cfg["A_merged_dir"], device, dtype,
+        load_trace=load_trace, component="A_merged_base",
+    )
     removed = sorted(set(cfg["B_indices"] + cfg["C_indices"]))
     model, _ = _ensure_original_layout(model, removed, cfg["original_N"])
-    _rehydrate(model, cfg["B_merged_dir"], cfg["B_indices"])
+    _rehydrate(model, cfg["B_merged_dir"], cfg["B_indices"], load_trace=load_trace, component="B_rehydrate")
     return model
 
-def load_stage3(cfg, device, dtype):
+def load_stage3(cfg, device, dtype, load_trace=None):
     if cfg.get("final_merged_dir"):
-        return _load_base(cfg["final_merged_dir"], device, dtype)
-    model = _load_base(cfg["A_merged_dir"], device, dtype)
+        return _load_base(
+            cfg["final_merged_dir"], device, dtype,
+            load_trace=load_trace, component="final_merged_base",
+        )
+    model = _load_base(
+        cfg["A_merged_dir"], device, dtype,
+        load_trace=load_trace, component="A_merged_base",
+    )
     removed = sorted(set(cfg["B_indices"] + cfg["C_indices"]))
     model, _ = _ensure_original_layout(model, removed, cfg["original_N"])
-    _rehydrate(model, cfg["B_merged_dir"], cfg["B_indices"])
+    _rehydrate(model, cfg["B_merged_dir"], cfg["B_indices"], load_trace=load_trace, component="B_rehydrate")
     if cfg.get("C_merged_dir"):
-        _rehydrate(model, cfg["C_merged_dir"], cfg["C_indices"])
+        _rehydrate(model, cfg["C_merged_dir"], cfg["C_indices"], load_trace=load_trace, component="C_rehydrate")
     else:
-        _rehydrate(model, cfg["C_bundle_dir"], cfg["C_indices"])
+        _rehydrate(
+            model, cfg["C_bundle_dir"], cfg["C_indices"],
+            load_trace=load_trace, component="C_bundle_rehydrate",
+        )
     return model
 
-def load_dense(cfg, device, dtype):
+def load_dense(cfg, device, dtype, load_trace=None):
     repo_id = _require_hf_repo_id(cfg["original_model_dir"])
-    return _load_base(repo_id, device, dtype, local_files_only=False)
+    return _load_base(
+        repo_id, device, dtype,
+        local_files_only=False, load_trace=load_trace, component="dense_base",
+    )
 
 MAIN_LOADERS = {
     "Stage1": load_stage1, "Stage2": load_stage2,
@@ -400,6 +564,11 @@ def aggregate_results(all_results, output_dir, env_info):
 
     # ── Raw lm-eval metadata per config ──
     for cfg_name, r in all_results.items():
+        if "load_trace" in r:
+            trace_path = os.path.join(output_dir, f"load_trace_{cfg_name}.json")
+            with open(trace_path, "w") as f:
+                json.dump(r["load_trace"], f, indent=2, ensure_ascii=False)
+            print(f"[saved] {trace_path}")
         if "zero_shot_raw" in r:
             raw_path = os.path.join(output_dir, f"lm_eval_raw_{cfg_name}.json")
             with open(raw_path, "w") as f:
@@ -545,8 +714,9 @@ def main():
 
         print(f"\n{'─'*60}\n  {cfg_name}\n{'─'*60}")
         reset_gpu_stats()
-        model = loader(cfg, device, dtype)
-        result = {}
+        load_trace = []
+        model = loader(cfg, device, dtype, load_trace=load_trace)
+        result = {"load_trace": load_trace}
 
         # ── Parameter count ──
         print("  [Params] counting active parameters ...")
