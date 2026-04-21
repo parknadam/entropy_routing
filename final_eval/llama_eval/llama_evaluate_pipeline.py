@@ -20,7 +20,7 @@ CUDA_VISIBLE_DEVICES=5 python -m final_eval.llama_eval.llama_evaluate_pipeline \
 """
 
 
-import os, sys, json, re, inspect, argparse, gc, platform
+import os, sys, json, re, inspect, argparse, gc, platform, dataclasses
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -83,6 +83,37 @@ def collect_env_info(dtype_str: str) -> dict:
             torch.cuda.get_device_properties(0).total_mem / 1024**3, 1
         )
     return info
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(dataclasses.asdict(value))
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [_json_safe(v) for v in sorted(value, key=lambda item: repr(item))]
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if inspect.isroutine(value) or inspect.isclass(value):
+        module = getattr(value, "__module__", None)
+        qualname = getattr(value, "__qualname__", getattr(value, "__name__", None))
+        if module and qualname:
+            return f"<callable:{module}.{qualname}>"
+        return f"<callable:{value}>"
+    type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+    return f"<non-serializable:{type_name}>"
+
+def _dump_json(obj, handle, **kwargs):
+    json.dump(_json_safe(obj), handle, **kwargs)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -587,7 +618,7 @@ def aggregate_results(all_results, output_dir, env_info):
 
     json_path = os.path.join(output_dir, "eval_results.json")
     with open(json_path, "w") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+        _dump_json(output, f, indent=2, ensure_ascii=False)
     print(f"\n[saved] {json_path}")
 
     # ── Also save raw lm-eval metadata per config ──
@@ -595,12 +626,12 @@ def aggregate_results(all_results, output_dir, env_info):
         if "load_trace" in r:
             trace_path = os.path.join(output_dir, f"load_trace_{cfg_name}.json")
             with open(trace_path, "w") as f:
-                json.dump(r["load_trace"], f, indent=2, ensure_ascii=False)
+                _dump_json(r["load_trace"], f, indent=2, ensure_ascii=False)
             print(f"[saved] {trace_path}")
         if "zero_shot_raw" in r:
             raw_path = os.path.join(output_dir, f"lm_eval_raw_{cfg_name}.json")
             with open(raw_path, "w") as f:
-                json.dump(r["zero_shot_raw"], f, indent=2, ensure_ascii=False)
+                _dump_json(r["zero_shot_raw"], f, indent=2, ensure_ascii=False)
             print(f"[saved] {raw_path}")
 
     configs = list(all_results.keys())
